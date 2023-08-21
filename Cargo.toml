@@ -1,0 +1,36 @@
+[package]
+name = "fast_websocket_client"
+version = "0.1.0"
+edition = "2021"
+categories = ["asynchronous", "concurrency", "network-programming", "web-programming", "web-programming::websocket"]
+keywords = ["async", "client", "tokio", "websocket", "wss"]
+license = "Apache-2.0"
+authors = ["Hyoungjun Son"]
+description = "A fast asynchronous websocket client based on fastwebsockets library"
+repository = "https://github.com/Osteoporosis/fast_websocket_client/"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[[example]]
+name = "wss_client"
+path = "examples/wss_client.rs"
+
+[dependencies]
+fastwebsockets = { version = "0", features = ["upgrade"] }
+hyper = "0"
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["net", "rt"] }
+tokio-rustls = "0"
+url = "2"
+utf-8 = "0"
+webpki-roots = "0"
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros",  "rt-multi-thread", "time"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
