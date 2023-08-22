@@ -6,7 +6,7 @@ categories = ["asynchronous", "concurrency", "network-programming", "web-program
 keywords = ["async", "client", "tokio", "websocket", "wss"]
 license = "Apache-2.0"
 authors = ["Hyoungjun Son"]
-description = "A fast asynchronous websocket client based on fastwebsockets library"
+description = "A fast asynchronous websocket client built on top of fastwebsockets library"
 repository = "https://github.com/Osteoporosis/fast_websocket_client/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
