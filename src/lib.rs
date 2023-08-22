@@ -8,6 +8,9 @@
 //! Please read [examples/wss_client.rs](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/wss_client.rs) or see below.
 //!
 //! ```
+//! // try this example with
+//! // $ cargo run --example wss_client
+//!
 //! use std::time::{Duration, Instant};
 //!
 //! use fast_websocket_client::{client, connect, OpCode};
