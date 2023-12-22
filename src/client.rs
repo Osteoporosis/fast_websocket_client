@@ -74,7 +74,7 @@ impl Offline {
 
     pub async fn connect(&mut self, url: &str) -> Result<Online, Box<dyn std::error::Error>> {
         let url = url::Url::parse(url).expect("invalid url");
-        let host = url.host_str().expect("invalid host");
+        let host = url.host_str().expect("invalid host").to_owned();
         let port = url.port_or_known_default().expect("the port is unknown");
         let address = format!("{host}:{port}");
         let tcp_stream = tokio::net::TcpStream::connect(&address).await?;
@@ -90,19 +90,18 @@ impl Offline {
                 fastwebsockets::handshake::generate_key(),
             )
             .header("Sec-WebSocket-Version", "13")
-            .body(hyper::Body::empty())?;
+            .body(http_body_util::Empty::<hyper::body::Bytes>::new())?;
 
         let (mut ws, _) = match url.scheme() {
             "wss" | "https" => {
                 let tls_connector = crate::tls_connector::get_tls_connector();
-                let server_name =
-                    tokio_rustls::rustls::ServerName::try_from(host).map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name")
-                    })?;
+                let server_name = rustls_pki_types::ServerName::try_from(host).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name")
+                })?;
                 let tls_stream = tls_connector.connect(server_name, tcp_stream).await?;
-                fastwebsockets::handshake::client(&SpawnExecutor, request, tls_stream).await?
+                crate::handshake::get_websocket(&SpawnExecutor, request, tls_stream).await?
             }
-            _ => fastwebsockets::handshake::client(&SpawnExecutor, request, tcp_stream).await?,
+            _ => crate::handshake::get_websocket(&SpawnExecutor, request, tcp_stream).await?,
         };
 
         ws.set_writev(self.vectored);
@@ -117,7 +116,9 @@ impl Offline {
 }
 
 /// Provides receive/send functions and configuration setters.
-pub struct Online(crate::fragment::FragmentCollector<hyper::upgrade::Upgraded>);
+pub struct Online(
+    crate::fragment::FragmentCollector<hyper_util::rt::tokio::TokioIo<hyper::upgrade::Upgraded>>,
+);
 
 impl Online {
     /// Sets whether to use vectored writes. This option does not guarantee that vectored writes will be always used.
@@ -163,6 +164,10 @@ impl Online {
     pub fn set_auto_apply_mask(&mut self, auto_apply_mask: bool) -> &mut Self {
         self.0.set_auto_apply_mask(auto_apply_mask);
         self
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
 
     /// Reads a frame. Text frames payload is guaranteed to be valid UTF-8.

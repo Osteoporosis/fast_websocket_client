@@ -44,7 +44,7 @@
 //!         let future = connect(url);
 //!         /*
 //!             alternative code for an example
-//!             make a Offline client and apply settings before `connect`
+//!             make a Offline client and apply an intentional error raising setting before `connect`
 //!         */
 //!         // let mut client = client::Offline::new();
 //!         // client.set_max_message_size(64);
@@ -114,7 +114,7 @@
 //!     }
 //!     Ok(())
 //! }
-//!  ```
+//! ```
 
 pub mod client;
 pub use fastwebsockets::OpCode;
@@ -125,4 +125,7 @@ pub async fn connect(url: &str) -> Result<self::client::Online, Box<dyn std::err
 }
 
 mod fragment;
+mod handshake;
+mod recv;
 mod tls_connector;
+mod websocket;
