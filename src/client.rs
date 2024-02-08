@@ -72,7 +72,10 @@ impl Offline {
         self
     }
 
-    pub async fn connect(&mut self, url: &str) -> Result<Online, Box<dyn std::error::Error>> {
+    pub async fn connect(
+        &mut self,
+        url: &str,
+    ) -> Result<Online, Box<dyn std::error::Error + Send + Sync>> {
         let url = url::Url::parse(url).expect("invalid url");
         let host = url.host_str().expect("invalid host").to_owned();
         let port = url.port_or_known_default().expect("the port is unknown");
@@ -173,8 +176,8 @@ impl Online {
     /// Reads a frame. Text frames payload is guaranteed to be valid UTF-8.
     pub async fn receive_frame(
         &mut self,
-    ) -> Result<fastwebsockets::Frame, fastwebsockets::WebSocketError> {
-        self.0.read_frame().await
+    ) -> Result<fastwebsockets::Frame, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.read_frame().await?)
     }
 
     async fn _send_frame(
@@ -193,39 +196,63 @@ impl Online {
     }
 
     /// Sends a ping frame to the stream.
-    pub async fn send_ping(&mut self, data: &str) -> Result<(), fastwebsockets::WebSocketError> {
-        self._send_frame(crate::OpCode::Ping, data.as_bytes()).await
+    pub async fn send_ping(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self._send_frame(crate::OpCode::Ping, data.as_bytes())
+            .await?;
+        Ok(())
     }
 
     /// Sends a pong frame to the stream.
-    pub async fn send_pong(&mut self, data: &str) -> Result<(), fastwebsockets::WebSocketError> {
-        self._send_frame(crate::OpCode::Pong, data.as_bytes()).await
+    pub async fn send_pong(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self._send_frame(crate::OpCode::Pong, data.as_bytes())
+            .await?;
+        Ok(())
     }
 
     /// Sends a string to the stream.
-    pub async fn send_string(&mut self, data: &str) -> Result<(), fastwebsockets::WebSocketError> {
-        self._send_frame(crate::OpCode::Text, data.as_bytes()).await
+    pub async fn send_string(
+        &mut self,
+        data: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self._send_frame(crate::OpCode::Text, data.as_bytes())
+            .await?;
+        Ok(())
     }
 
     /// Sends a serialized json to the stream.
     pub async fn send_json(
         &mut self,
         data: impl serde::Serialize,
-    ) -> Result<(), fastwebsockets::WebSocketError> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json_bytes = serde_json::to_vec(&data)
             .expect("Failed to serialize data passed to send_json into JSON");
         self._send_frame(crate::OpCode::Text, json_bytes.as_slice())
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Sends binary data to the stream.
-    pub async fn send_binary(&mut self, data: &[u8]) -> Result<(), fastwebsockets::WebSocketError> {
-        self._send_frame(crate::OpCode::Text, data).await
+    pub async fn send_binary(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self._send_frame(crate::OpCode::Text, data).await?;
+        Ok(())
     }
 
     /// Sends a close frmae to the stream.
-    pub async fn send_close(&mut self, data: &[u8]) -> Result<(), fastwebsockets::WebSocketError> {
-        self._send_frame(crate::OpCode::Close, data).await
+    pub async fn send_close(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self._send_frame(crate::OpCode::Close, data).await?;
+        Ok(())
     }
 }
 
