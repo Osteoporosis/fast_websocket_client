@@ -1,8 +1,14 @@
 [package]
 name = "fast_websocket_client"
-version = "0.2.0"
-edition = "2021"
-categories = ["asynchronous", "concurrency", "network-programming", "web-programming", "web-programming::websocket"]
+version = "0.3.0"
+edition = "2024"
+categories = [
+    "asynchronous",
+    "concurrency",
+    "network-programming",
+    "web-programming",
+    "web-programming::websocket",
+]
 keywords = ["async", "client", "tokio", "websocket", "wss"]
 license = "Apache-2.0"
 authors = ["Hyoungjun Son"]
@@ -13,30 +19,39 @@ repository = "https://github.com/Osteoporosis/fast_websocket_client/"
 
 [[example]]
 name = "wss_client"
-path = "examples/wss_client.rs"
+path = "examples/async_callback_client.rs"
 
 [dependencies]
-fastwebsockets = { version = "0.6", features = ["simd", "upgrade"] }
-http-body-util = "0"
-hyper = "1"
-hyper-util = "0"
-rustls-pki-types = "1"
-serde = "1"
-serde_json = "1"
-simdutf8 = { version = "0", features = ["aarch64_neon"] }
-tokio = { version = "1", default-features = false, features = ["net", "parking_lot", "rt"] }
-tokio-rustls = "0.25"
-url = "2"
-utf-8 = "0"
-webpki-roots = "0"
+fastwebsockets = { version = "0.10.0", features = ["simd", "upgrade"] }
+http-body-util = "0.1.3"
+hyper = "1.6.0"
+hyper-util = "0.1.11"
+rustls-pki-types = "1.11.0"
+serde = "1.0.219"
+serde_json = "1.0.140"
+simdutf8 = { version = "0.1.5", features = ["aarch64_neon"] }
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", default-features = false, features = [
+    "net",
+    "parking_lot",
+    "rt",
+] }
+tokio-rustls = "0.26.2"
+url = "2.5.4"
+webpki-roots = "0.26.8"
 
 [features]
-default = ["simd"]
-simd = []
+default = ["callback_client"]
+callback_client = ["tokio/macros"]
 
 [dev-dependencies]
-serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", default-features = false, features = ["macros",  "parking_lot", "rt-multi-thread", "time"] }
+serde = { version = "1.0.219", features = ["derive"] }
+tokio = { version = "1.44.2", default-features = false, features = [
+    "macros",
+    "parking_lot",
+    "rt-multi-thread",
+    "time",
+] }
 
 [profile.release]
 opt-level = 3

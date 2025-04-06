@@ -1,143 +1,133 @@
 //! # fast_websocket_client
 //!
-//! A fast asynchronous websocket client built on top of [fastwebsockets](https://github.com/denoland/fastwebsockets) library
+//! ![Crates.io](https://img.shields.io/crates/v/fast_websocket_client)
+//! ![docs.rs](https://docs.rs/fast_websocket_client/badge.svg)
 //!
-//! ## `use fast_websocket_client::{client, connect, OpCode};`
+//! **A blazing-fast, async-native WebSocket client for Rust**, built on top of [`fastwebsockets`](https://github.com/denoland/fastwebsockets) and `tokio`.
 //!
-//! That's all you need to import. Just grap a slick toolbox and go.  
-//! Please read [examples/wss_client.rs](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/wss_client.rs) or see below.
+//! Supports two modes of operation:
+//! - 🔁 **High-level callback-based client** for ergonomic event-driven use.
+//! - ⚙️ **Low-level direct API** for fine-tuned control with minimal dependencies.
 //!
+//! Quick Example: [examples/async_callback_client.rs](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/async_callback_client.rs)
+//!
+//! ## 📦 Features
+//!
+//! - Async/await support via `tokio`
+//! - Built-in reconnection and ping loop
+//! - Optional callback-driven lifecycle management
+//! - Custom HTTP headers for handshake (e.g., Authorization)
+//!
+//! ## 🛠 Installation
+//!
+//! ```bash
+//! cargo add fast_websocket_client
 //! ```
+//!
+//! ## 🔁 High-Level Callback API
+//!
+//! An ergonomic, JavaScript-like API with built-in reconnect, ping, and lifecycle hooks.
+//!
+//! ```rust
 //! // try this example with
-//! // $ cargo run --example wss_client
+//! // `cargo run --example wss_client`
 //!
-//! use std::time::{Duration, Instant};
+//! use tokio::time::{Duration, sleep};
+//! use fast_websocket_client::WebSocket;
 //!
-//! use fast_websocket_client::{client, connect, OpCode};
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
+//!     let ws = WebSocket::new("wss://echo.websocket.org").await?;
 //!
-//! #[derive(serde::Serialize)]
-//! struct Subscription {
-//!     method: String,
-//!     params: Vec<String>,
-//!     id: u128,
-//! }
+//!     ws.on_close(|_| async move {
+//!         println!("[CLOSE] WebSocket connection closed.");
+//!     })
+//!     .await;
+//!     ws.on_message(|message| async move {
+//!         println!("[MESSAGE] {}", message);
+//!     })
+//!     .await;
 //!
-//! async fn subscribe(
-//!     client: &mut client::Online,
-//!     started_at: Instant,
-//! ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     let data = Subscription {
-//!         method: "SUBSCRIBE".to_string(),
-//!         params: vec!["btcusdt@bookTicker".to_string()],
-//!         id: started_at.elapsed().as_nanos(),
-//!     };
-//!     tokio::time::timeout(Duration::from_millis(0), client.send_json(&data)).await??;
-//!     Ok(())
-//! }
-//!
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let started_at = Instant::now();
-//!     let runtime = tokio::runtime::Builder::new_current_thread()
-//!         .enable_all()
-//!         .build()
-//!         .unwrap();
-//!
-//!     // the lowest volume example
-//!     let url = "wss://data-stream.binance.vision:9443/ws/bakeusdt@bookTicker";
-//!
-//!     let handle = runtime.spawn(async move {
-//!         'reconnect_loop: loop {
-//!             let future = connect(url);
-//!             /*
-//!                 alternative code for an example:
-//!                     1. make a Offline client
-//!                     2. apply an intentional error raising setting before `connect`
-//!                     3. call `connect` to get a future
-//!             */
-//!             // let mut client = client::Offline::new();
-//!             // client.set_max_message_size(64);
-//!             // let future = client.connect(url);
-//!
-//!             let mut client: client::Online = match future.await {
-//!                 Ok(client) => {
-//!                     println!("conneted");
-//!                     client
-//!                 }
-//!                 Err(e) => {
-//!                     eprintln!("Reconnecting from an Error: {e:?}");
-//!                     tokio::time::sleep(Duration::from_secs(10)).await;
-//!                     continue;
-//!                 }
-//!             };
-//!
-//!             // we can modify settings while running.
-//!             // without pong, this app stops in about 15 minutes.(by the binance API spec.)
-//!             client.set_auto_pong(false);
-//!
-//!             // add one more example subscription here after connect
-//!             if let Err(e) = subscribe(&mut client, started_at).await {
-//!                 eprintln!("Reconnecting from an Error: {e:?}");
-//!                 let _ = client.send_close(&[]).await;
-//!                 tokio::time::sleep(Duration::from_secs(10)).await;
-//!                 continue;
-//!             };
-//!
-//!             // message processing loop
-//!             loop {
-//!                 let message = if let Ok(result) =
-//!                     tokio::time::timeout(Duration::from_millis(100), client.receive_frame()).await
-//!                 {
-//!                     match result {
-//!                         Ok(message) => message,
-//!                         Err(e) => {
-//!                             eprintln!("Reconnecting from an Error: {e:?}");
-//!                             let _ = client.send_close(&[]).await;
-//!                             break; // break the message loop then reconnect
-//!                         }
-//!                     }
-//!                 } else {
-//!                     println!("timeout");
-//!                     continue;
-//!                 };
-//!
-//!                 match message.opcode {
-//!                     OpCode::Text => {
-//!                         let payload = match simdutf8::basic::from_utf8(message.payload.as_ref()) {
-//!                             Ok(payload) => payload,
-//!                             Err(e) => {
-//!                                 eprintln!("Reconnecting from an Error: {e:?}");
-//!                                 let _ = client.send_close(&[]).await;
-//!                                 break; // break the message loop then reconnect
-//!                             }
-//!                         };
-//!                         println!("{payload}");
-//!                     }
-//!                     OpCode::Close => {
-//!                         println!("{:?}", String::from_utf8_lossy(message.payload.as_ref()));
-//!                         break 'reconnect_loop;
-//!                     }
-//!                     _ => {}
-//!                 }
-//!             }
+//!     sleep(Duration::from_secs(1)).await;
+//!     for i in 1..5 {
+//!         let message = format!("#{}", i);
+//!         if let Err(e) = ws.send(&message).await {
+//!             eprintln!("[ERROR] Send error: {:?}", e);
+//!             break;
 //!         }
-//!     });
-//!     runtime.block_on(handle)?;
+//!         println!("[SEND] {}", message);
+//!         sleep(Duration::from_secs(5)).await;
+//!     }
+//!
+//!     ws.close().await;
+//!     ws.await_shutdown().await;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## 🧵 Low-Level API
+//!
+//! ```rust
+//! use fast_websocket_client::{connect, OpCode};
+//!
+//! #[tokio::main(flavor = "current_thread")]
+//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     let mut client = connect("wss://echo.websocket.org").await?;
+//!
+//!     client.send_string("Hello, WebSocket!").await?;
+//!
+//!     let frame = client.receive_frame().await?;
+//!     if frame.opcode == OpCode::Text {
+//!         println!("Received: {}", String::from_utf8_lossy(&frame.payload));
+//!     }
+//!
+//!     client.send_close("bye").await?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## 🧪 Running the Example
+//!
+//! Clone the repo and run:
+//!
+//! ```bash
+//! cargo run --example wss_client
+//! ```
+//!
+//! ## 🔄 Migration Guide (from `0.2.0`)
+//!
+//! | Old                                     | New                    |
+//! |-----------------------------------------|------------------------|
+//! | `client::Offline`                       | `base_client::Offline` |
+//! | `client::Online`                        | `base_client::Online`  |
+//! | Runtime settings via `Online`'s methods | Must now be set before connect via `ConnectionInitOptions`.<br>Changes to the running `WebSocket` take effect on the next (re)connection. |
+//!
+//! **New users:** We recommend starting with the `WebSocket` API for best experience.
+//!
+//! ## 📚 Documentation
+//!
+//! - [docs.rs/fast_websocket_client](https://docs.rs/fast_websocket_client)
+//! - [Examples](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/)
+//! - [fastwebsockets upstream](https://github.com/denoland/fastwebsockets)
+//!
+//! ---
+//!
+//! 💡 Actively maintained – **contributions are welcome!**
+//!
 
+pub mod base_client;
+pub use base_client::connect;
+
+#[cfg(feature = "callback_client")]
 pub mod client;
+#[cfg(feature = "callback_client")]
+pub use client as callback_client;
+#[cfg(feature = "callback_client")]
+pub use client::{
+    ClientConfig, ConnectionInitOptions, WebSocket, WebSocketBuilder, WebSocketClientError,
+};
+
 pub use fastwebsockets::OpCode;
+pub use hyper::HeaderMap;
 
-/// Connects to the url and returns an Online client.
-pub async fn connect(
-    url: &str,
-) -> Result<self::client::Online, Box<dyn std::error::Error + Send + Sync>> {
-    self::client::Offline::new().connect(url).await
-}
-
-mod fragment;
-mod handshake;
-mod recv;
 mod tls_connector;
-mod websocket;

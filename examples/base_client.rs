@@ -1,9 +1,6 @@
-// try this example with
-// $ cargo run --example wss_client
-
 use std::time::{Duration, Instant};
 
-use fast_websocket_client::{client, connect, OpCode};
+use fast_websocket_client::{OpCode, base_client};
 
 #[derive(serde::Serialize)]
 struct Subscription {
@@ -13,7 +10,7 @@ struct Subscription {
 }
 
 async fn subscribe(
-    client: &mut client::Online,
+    client: &mut base_client::Online,
     started_at: Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data = Subscription {
@@ -37,20 +34,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let handle = runtime.spawn(async move {
         'reconnect_loop: loop {
-            let future = connect(url);
+            let future = base_client::connect(url);
             /*
                 alternative code for an example:
                     1. make a Offline client
                     2. apply an intentional error raising setting before `connect`
                     3. call `connect` to get a future
             */
-            // let mut client = client::Offline::new();
+            // let mut client = base_client::Offline::new();
             // client.set_max_message_size(64);
             // let future = client.connect(url);
 
-            let mut client: client::Online = match future.await {
+            let mut client: base_client::Online = match future.await {
                 Ok(client) => {
-                    println!("conneted");
+                    println!("connected");
                     client
                 }
                 Err(e) => {
@@ -60,14 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // we can modify settings while running.
-            // without pong, this app stops in about 15 minutes.(by the binance API spec.)
-            client.set_auto_pong(false);
-
             // add one more example subscription here after connect
             if let Err(e) = subscribe(&mut client, started_at).await {
                 eprintln!("Reconnecting from an Error: {e:?}");
-                let _ = client.send_close(&[]).await;
+                let _ = client.send_close("").await;
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             };
@@ -81,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(message) => message,
                         Err(e) => {
                             eprintln!("Reconnecting from an Error: {e:?}");
-                            let _ = client.send_close(&[]).await;
+                            let _ = client.send_close("").await;
                             break; // break the message loop then reconnect
                         }
                     }
@@ -96,14 +89,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(payload) => payload,
                             Err(e) => {
                                 eprintln!("Reconnecting from an Error: {e:?}");
-                                let _ = client.send_close(&[]).await;
+                                let _ = client.send_close("").await;
                                 break; // break the message loop then reconnect
                             }
                         };
                         println!("{payload}");
                     }
                     OpCode::Close => {
-                        println!("{:?}", String::from_utf8_lossy(message.payload.as_ref()));
+                        println!("{:?}", String::from_utf8_lossy(&message.payload[2..]));
                         break 'reconnect_loop;
                     }
                     _ => {}
