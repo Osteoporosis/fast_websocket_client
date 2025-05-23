@@ -1,6 +1,6 @@
 [package]
 name = "fast_websocket_client"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 categories = [
     "asynchronous",
@@ -12,7 +12,7 @@ categories = [
 keywords = ["async", "client", "tokio", "websocket", "wss"]
 license = "Apache-2.0"
 authors = ["Hyoungjun Son"]
-description = "A fast asynchronous websocket client built on top of fastwebsockets library"
+description = "A blazing-fast, async-native WebSocket client for Rust, built on top of fastwebsockets and tokio"
 repository = "https://github.com/Osteoporosis/fast_websocket_client/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -25,20 +25,20 @@ path = "examples/async_callback_client.rs"
 fastwebsockets = { version = "0.10.0", features = ["simd", "upgrade"] }
 http-body-util = "0.1.3"
 hyper = "1.6.0"
-hyper-util = "0.1.11"
-rustls-pki-types = "1.11.0"
+hyper-util = "0.1.12"
+rustls-pki-types = "1.12.0"
 serde = "1.0.219"
 serde_json = "1.0.140"
 simdutf8 = { version = "0.1.5", features = ["aarch64_neon"] }
 thiserror = "2.0.12"
-tokio = { version = "1.44.2", default-features = false, features = [
+tokio = { version = "1.45.0", default-features = false, features = [
     "net",
     "parking_lot",
     "rt",
 ] }
 tokio-rustls = "0.26.2"
 url = "2.5.4"
-webpki-roots = "0.26.8"
+webpki-roots = "1.0.0"
 
 [features]
 default = ["callback_client"]
@@ -46,12 +46,13 @@ callback_client = ["tokio/macros"]
 
 [dev-dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
-tokio = { version = "1.44.2", default-features = false, features = [
+tokio = { version = "1.45.0", default-features = false, features = [
     "macros",
     "parking_lot",
     "rt-multi-thread",
     "time",
 ] }
+futures = "0.3.31"
 
 [profile.release]
 opt-level = 3

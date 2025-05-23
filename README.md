@@ -1,9 +1,9 @@
 # fast_websocket_client
 
-![Crates.io](https://img.shields.io/crates/v/fast_websocket_client)
-![docs.rs](https://docs.rs/fast_websocket_client/badge.svg)
+[![Crates.io](https://img.shields.io/crates/v/fast_websocket_client)](https://crates.io/crates/fast_websocket_client)
+[![docs.rs](https://docs.rs/fast_websocket_client/badge.svg)](https://docs.rs/fast_websocket_client)
 
-**A blazing-fast, async-native WebSocket client for Rust**, built on top of [`fastwebsockets`](https://github.com/denoland/fastwebsockets) and `tokio`.
+**A blazing-fast, async-native WebSocket client for Rust**, built on top of [`fastwebsockets`](https://github.com/denoland/fastwebsockets) and [`tokio`](https://tokio.rs).
 
 Supports two modes of operation:
 - 🔁 **High-level callback-based client** for ergonomic event-driven use.
