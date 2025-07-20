@@ -1,18 +1,10 @@
 services:
   squid:
     image: ubuntu/squid
+    container_name: squid
     ports: ["3128:3128"]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3128"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
 
   socks5:
     image: serjs/go-socks5-proxy
+    container_name: socks5
     ports: ["1080:1080"]
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "1080"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
