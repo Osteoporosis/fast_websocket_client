@@ -8,6 +8,10 @@ use tokio::time::{Duration, sleep};
 async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     let ws = WebSocket::new("wss://echo.websocket.org").await?;
 
+    ws.on_open(|_| async move {
+        println!("[OPEN] WebSocket connection opened.");
+    })
+    .await;
     ws.on_close(|_| async move {
         println!("[CLOSE] WebSocket connection closed.");
     })
@@ -17,7 +21,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     })
     .await;
 
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(2)).await;
     for i in 1..5 {
         let message = format!("#{}", i);
         if let Err(e) = ws.send(&message).await {
@@ -25,7 +29,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
             break;
         }
         println!("[SEND] {}", message);
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(2)).await;
     }
 
     ws.close().await;
@@ -49,6 +53,9 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     async function main() {
       const ws = new WebSocket("wss://echo.websocket.org");
 
+      ws.onopen = () => {
+        console.log("[OPEN] WebSocket connection opened.");
+      };
       ws.onclose = () => {
         console.log("[CLOSE] WebSocket connection closed.");
       };
@@ -56,7 +63,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
         console.log("[MESSAGE]", event.data);
       };
 
-      await sleep(1000);
+      await sleep(2000);
       for (let i = 1; i < 5; i++) {
         const message = `#${i}`;
         try {
@@ -66,7 +73,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
           console.error("[ERROR] Send error:", err);
           break;
         }
-        await sleep(5000);
+        await sleep(2000);
       }
 
       ws.close();

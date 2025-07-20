@@ -3,28 +3,31 @@
 [![Crates.io](https://img.shields.io/crates/v/fast_websocket_client)](https://crates.io/crates/fast_websocket_client)
 [![docs.rs](https://docs.rs/fast_websocket_client/badge.svg)](https://docs.rs/fast_websocket_client)
 
-**A blazing-fast, async-native WebSocket client for Rust**, built on top of [`fastwebsockets`](https://github.com/denoland/fastwebsockets) and [`tokio`](https://tokio.rs).
+**Tokio-native WebSocket client for Rust** – high-throughput, low-latency, callback-driven, proxy-ready.
 
 Supports two modes of operation:
-- 🔁 **High-level callback-based client** for ergonomic event-driven use.
-- ⚙️ **Low-level direct API** for fine-tuned control with minimal dependencies.
+- **High-level callback-based client** for ergonomic event-driven use.
+- **Low-level direct API** for fine-tuned control with minimal dependencies.
 
 Quick Example: [examples/async_callback_client.rs](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/async_callback_client.rs)
 
-## 📦 Features
+## Features
 
+- JavaScript-like callback API for event handling
 - Async/await support via `tokio`
+- Powered by [`fastwebsockets`](https://github.com/denoland/fastwebsockets)
 - Built-in reconnection and ping loop
-- Optional callback-driven lifecycle management
+- TLS support
 - Custom HTTP headers for handshake (e.g., Authorization)
+- Proxy support (HTTP CONNECT & SOCKS5)
 
-## 🛠 Installation
+## Installation
 
 ```bash
 cargo add fast_websocket_client
 ```
 
-## 🔁 High-Level Callback API
+## High-Level Callback API
 
 An ergonomic, JavaScript-like API with built-in reconnect, ping, and lifecycle hooks.
 
@@ -39,6 +42,10 @@ use fast_websocket_client::WebSocket;
 async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     let ws = WebSocket::new("wss://echo.websocket.org").await?;
 
+    ws.on_open(|_| async move {
+        println!("[OPEN] WebSocket connection opened.");
+    })
+    .await;
     ws.on_close(|_| async move {
         println!("[CLOSE] WebSocket connection closed.");
     })
@@ -48,7 +55,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     })
     .await;
 
-    sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(2)).await;
     for i in 1..5 {
         let message = format!("#{}", i);
         if let Err(e) = ws.send(&message).await {
@@ -56,7 +63,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
             break;
         }
         println!("[SEND] {}", message);
-        sleep(Duration::from_secs(5)).await;
+        sleep(Duration::from_secs(2)).await;
     }
 
     ws.close().await;
@@ -65,7 +72,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
 }
 ```
 
-## 🧵 Low-Level API
+## Low-Level API
 
 ```rust
 use fast_websocket_client::{connect, OpCode};
@@ -86,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
-## 🧪 Running the Example
+## Running the Example
 
 Clone the repo and run:
 
@@ -94,7 +101,7 @@ Clone the repo and run:
 cargo run --example wss_client
 ```
 
-## 🔄 Migration Guide (from `0.2.0`)
+## Migration Guide (from `0.2.0`)
 
 | Old                                     | New                    |
 |-----------------------------------------|------------------------|
@@ -104,7 +111,7 @@ cargo run --example wss_client
 
 **New users:** We recommend starting with the `WebSocket` API for best experience.
 
-## 📚 Documentation
+## Documentation
 
 - [docs.rs/fast_websocket_client](https://docs.rs/fast_websocket_client)
 - [Examples](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/)
@@ -112,4 +119,4 @@ cargo run --example wss_client
 
 ---
 
-💡 Actively maintained – **contributions are welcome!**
+💡 Actively maintained - **contributions are welcome!**

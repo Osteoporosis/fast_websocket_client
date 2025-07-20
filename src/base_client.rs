@@ -1,9 +1,23 @@
-/// Connects to the url and returns an Online client.
+/// Convenience helper: connect to `url` and return an [`Online`] client.
+///
+/// This is equivalent to:
+/// ```
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let mut offline = fast_websocket_client::base_client::Offline::new();
+///     let online = offline.connect("wss://echo.websocket.org").await?;
+///     let _ = online;
+///     Ok(())
+/// }
+/// ```
 pub async fn connect(url: &str) -> Result<self::Online, Box<dyn std::error::Error + Send + Sync>> {
     self::Offline::new().connect(url).await
 }
 
-/// A struct actually provides `connect` function. This also holds settings before `connect`.
+/// Builder-like struct holding connection options **before** the handshake.
+///
+/// Use [`Offline::new`] and its `set_*` / `add_header` methods, then call
+/// [`Offline::connect`] to obtain an [`Online`] WebSocket.
 pub struct Offline {
     vectored: bool,
     auto_close: bool,
@@ -12,6 +26,8 @@ pub struct Offline {
     writev_threshold: usize,
     auto_apply_mask: bool,
     custom_headers: crate::HeaderMap,
+    #[cfg(feature = "proxy")]
+    proxy: Option<crate::proxy::Proxy>,
 }
 
 impl Default for Offline {
@@ -31,37 +47,31 @@ impl Offline {
             writev_threshold: 1024,
             auto_apply_mask: true,
             custom_headers: crate::HeaderMap::new(),
+            #[cfg(feature = "proxy")]
+            proxy: None,
         }
     }
 
     /// Adds a custom HTTP header to be included in the WebSocket handshake request.
     ///
-    /// This can be used to include authentication tokens, custom identifiers,
-    /// or any other HTTP headers required by the server.
-    ///
-    /// # Examples
-    ///
     /// ```
+    /// use fast_websocket_client::base_client::Offline;
+    ///
     /// let mut client = Offline::new();
     /// client
     ///     .add_header("Authorization", "Bearer mytoken")
     ///     .add_header("X-Custom-Header", "custom-value");
     /// ```
-    ///
-    /// # Parameters
-    ///
-    /// - `key`: The name of the header. This can be any type that converts into [`hyper::header::HeaderName`].
-    /// - `value`: The value of the header. This can be any type that converts into [`hyper::header::HeaderValue`].
-    ///
-    /// # Returns
-    ///
-    /// Returns a mutable reference to `self`, allowing method chaining.
-    pub fn add_header(
-        &mut self,
-        key: impl Into<hyper::header::HeaderName>,
-        value: impl Into<hyper::header::HeaderValue>,
-    ) -> &mut Self {
-        self.custom_headers.insert(key.into(), value.into());
+    pub fn add_header<K, V>(&mut self, key: K, value: V) -> &mut Self
+    where
+        K: std::convert::TryInto<hyper::header::HeaderName>,
+        K::Error: std::fmt::Debug,
+        V: std::convert::TryInto<hyper::header::HeaderValue>,
+        V::Error: std::fmt::Debug,
+    {
+        let name = key.try_into().expect("invalid header name");
+        let val = value.try_into().expect("invalid header value");
+        self.custom_headers.insert(name, val);
         self
     }
 
@@ -110,6 +120,27 @@ impl Offline {
         self
     }
 
+    #[cfg(feature = "proxy")]
+    /// Sets a proxy to be used when establishing a connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy` - The proxy to be used.
+    pub fn set_proxy(&mut self, proxy: Option<crate::proxy::Proxy>) -> &mut Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// Perform the TCP/TLS/WebSocket handshake with the stored options.
+    ///
+    /// * Respects the `proxy` feature and custom headers.  
+    /// * Applies `fastwebsockets` tuning parameters immediately after
+    ///   the handshake.
+    ///
+    /// # Errors
+    ///
+    /// * URL parse / DNS / TCP / TLS failures  
+    /// * WebSocket handshake errors
     pub async fn connect(
         &mut self,
         url: &str,
@@ -118,6 +149,14 @@ impl Offline {
         let host = url.host_str().expect("invalid host").to_owned();
         let port = url.port_or_known_default().expect("the port is unknown");
         let address = format!("{host}:{port}");
+
+        #[cfg(feature = "proxy")]
+        let tcp_stream = if let Some(proxy) = &self.proxy {
+            proxy.tunnel(&host, port).await?
+        } else {
+            tokio::net::TcpStream::connect(&address).await?
+        };
+        #[cfg(not(feature = "proxy"))]
         let tcp_stream = tokio::net::TcpStream::connect(&address).await?;
 
         let mut req_builder = hyper::Request::builder()
@@ -167,7 +206,10 @@ pub struct Online(
 );
 
 impl Online {
-    /// Reads a frame. Text frames payload is guaranteed to be valid UTF-8.
+    /// Receive the next WebSocket frame from the server.
+    ///
+    /// *Text frame payloads are validated as UTF-8* by
+    /// `fastwebsockets::FragmentCollector`.
     #[inline]
     pub async fn receive_frame(
         &mut self,
@@ -210,7 +252,10 @@ impl Online {
         Ok(())
     }
 
-    /// Sends a string to the stream.
+    /// Send a UTF-8 text frame.
+    ///
+    /// # Errors
+    /// Propagates underlying I/O or protocol errors from `fastwebsockets`.
     #[inline]
     pub async fn send_string(
         &mut self,
@@ -221,7 +266,7 @@ impl Online {
         Ok(())
     }
 
-    /// Sends a serialized json to the stream.
+    /// Serialize `data` to JSON and send as a text frame.
     #[inline]
     pub async fn send_json(
         &mut self,
@@ -234,7 +279,8 @@ impl Online {
         Ok(())
     }
 
-    /// Sends binary data to the stream.
+    /// Send binary payload as an **unmasked** binary frame (masking is
+    /// handled automatically when `auto_apply_mask` is true).
     #[inline]
     pub async fn send_binary(
         &mut self,
@@ -245,7 +291,9 @@ impl Online {
         Ok(())
     }
 
-    /// Sends a close frame to the stream.
+    /// Transmit a WebSocket Close frame with [`fastwebsockets::CloseCode::Normal`].
+    ///
+    /// Pass an empty string to omit the reason.
     pub async fn send_close(
         &mut self,
         data: &str,
