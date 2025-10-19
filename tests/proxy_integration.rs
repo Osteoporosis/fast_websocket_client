@@ -37,6 +37,7 @@ async fn http_proxy() {
 async fn socks5_proxy() {
     let proxy = ProxyBuilder::new()
         .socks5("localhost:1080")
+        .auth("myuser", "mypassword")
         .build()
         .unwrap();
     roundtrip(Some(ConnectionInitOptions::new().proxy(Some(proxy)))).await;

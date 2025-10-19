@@ -213,7 +213,7 @@ impl Online {
     #[inline]
     pub async fn receive_frame(
         &mut self,
-    ) -> Result<fastwebsockets::Frame, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<fastwebsockets::Frame<'_>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.0.read_frame().await?)
     }
 

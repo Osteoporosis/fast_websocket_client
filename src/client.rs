@@ -586,10 +586,10 @@ async fn run(
                 };
 
                 callbacks.call_on_open().await;
-                if let Some(message) = message {
-                    if let Err(e) = client.send_string(&message).await {
-                        callbacks.call_on_error(e.to_string()).await;
-                    }
+                if let Some(message) = message
+                    && let Err(e) = client.send_string(&message).await
+                {
+                    callbacks.call_on_error(e.to_string()).await;
                 }
                 if shutdown {
                     callbacks.call_on_close().await;
