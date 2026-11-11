@@ -1,4 +1,4 @@
-use fast_websocket_client::WebSocketBuilder;
+use fast_websocket_client::{ClientConfig, WebSocketBuilder};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
@@ -28,12 +28,15 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     // channel for parsed message numbers
     let (msg_tx, mut msg_rx) = mpsc::channel::<u32>(1);
 
-    // build and connect the WebSocket client
+    // Register callbacks before starting the first background connection attempt.
     let ws = WebSocketBuilder::new()
         .on_open(move |_| handle_open(open_tx.clone()))
         .on_close(|_| handle_close())
         .on_message(move |msg| handle_message(msg_tx.clone(), msg))
-        .connect("wss://echo.websocket.org")
+        .connect_with_config(
+            "wss://echo.websocket.org",
+            ClientConfig::new().with_close_timeout(Duration::from_secs(3)),
+        )
         .await?;
 
     // wait for the connection to open
@@ -53,6 +56,6 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     // wait a bit and then close
     sleep(Duration::from_secs(2)).await;
     ws.close().await;
-    ws.await_shutdown().await;
+    ws.await_shutdown().await?;
     Ok(())
 }

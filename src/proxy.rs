@@ -1,8 +1,13 @@
 use std::error::Error;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use base64::Engine;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::{TlsConnector, client::TlsStream};
 use tokio_socks::tcp::Socks5Stream;
 use url::Url;
 
@@ -37,9 +42,13 @@ impl ProxyBuilder {
 
     /// Set an **HTTP CONNECT** proxy URI (`http://…` or `https://…`).
     ///
-    /// Returns the builder on success, or a URL-parse error on failure.
-    pub fn http(mut self, uri: &str) -> Result<Self, Box<dyn Error>> {
+    /// HTTPS proxies use TLS with certificate and hostname verification before
+    /// sending the CONNECT request or proxy credentials.
+    /// Returns an error for an invalid URL, unsupported scheme, or URL credentials.
+    /// Provide credentials with [`Self::auth`] instead.
+    pub fn http(mut self, uri: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let parsed = Url::parse(uri)?;
+        validate_http_proxy(&parsed)?;
         self.kind = Some(ProxyKind::Http(parsed));
         Ok(self)
     }
@@ -50,7 +59,7 @@ impl ProxyBuilder {
         self
     }
 
-    /// Provide Basic-Auth credentials for either proxy type.
+    /// Provide username/password credentials for either proxy type.
     pub fn auth(mut self, username: &str, password: &str) -> Self {
         self.auth = Some(ProxyAuth {
             username: username.to_string(),
@@ -63,7 +72,7 @@ impl ProxyBuilder {
     ///
     /// # Errors
     /// * Returns an error if neither `http` nor `socks5` was specified.
-    pub fn build(self) -> Result<Proxy, Box<dyn Error>> {
+    pub fn build(self) -> Result<Proxy, Box<dyn Error + Send + Sync>> {
         match self.kind {
             Some(ProxyKind::Http(uri)) => Ok(Proxy::Http {
                 uri,
@@ -87,9 +96,10 @@ pub struct ProxyAuth {
 
 /// Concrete proxy configuration returned by [`ProxyBuilder`].
 ///
-/// * `Http` – plain or TLS tunnel via HTTP CONNECT  
+/// * `Http` – plain or TLS tunnel via HTTP CONNECT
 /// * `Socks5` – TCP tunnel via SOCKS5 (optionally username/password)
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Proxy {
     Http {
         uri: Url,
@@ -102,32 +112,44 @@ pub enum Proxy {
 }
 
 impl Proxy {
-    /// Open a TCP tunnel through the proxy to `target_host:target_port`.
+    /// Open a stream through the proxy to `target_host:target_port`.
     ///
-    /// Returns a connected [`tokio::net::TcpStream`] ready for
-    /// TLS/WebSocket hand-shake.
+    /// Returns a connected stream ready for the destination's TLS/WebSocket handshake.
     ///
     /// # Errors
     ///
     /// * Underlying network I/O errors  
     /// * Authentication failures  
-    /// * Non-`200 OK` response from HTTP proxy
+    /// * Unsupported proxy scheme, invalid/oversized response, or non-2xx status
     pub(crate) async fn tunnel(
         &self,
         target_host: &str,
         target_port: u16,
-    ) -> Result<TcpStream, Box<dyn Error + Send + Sync>> {
+        tls_connector: &(impl Fn() -> Result<TlsConnector, Box<dyn Error + Send + Sync>> + Sync),
+    ) -> Result<ProxyStream, Box<dyn Error + Send + Sync>> {
         match self {
             Proxy::Http { uri, auth } => {
-                let proxy_addr = format!(
-                    "{}:{}",
-                    uri.host_str().ok_or("invalid proxy host")?,
-                    uri.port_or_known_default().ok_or("proxy port missing")?
-                );
+                // Proxy is public, so also validate configurations not made by the builder.
+                validate_http_proxy(uri)?;
+                let proxy_host = match uri.host().ok_or("invalid proxy host")? {
+                    url::Host::Domain(host) => host.to_owned(),
+                    url::Host::Ipv4(ip) => ip.to_string(),
+                    url::Host::Ipv6(ip) => ip.to_string(),
+                };
+                let proxy_port = uri.port_or_known_default().ok_or("proxy port missing")?;
+                let stream = TcpStream::connect((proxy_host.as_str(), proxy_port)).await?;
+                let mut stream = if uri.scheme() == "https" {
+                    let server_name = rustls_pki_types::ServerName::try_from(proxy_host)?;
+                    let stream = tls_connector()?.connect(server_name, stream).await?;
+                    ProxyStream::Tls(Box::new(stream))
+                } else {
+                    ProxyStream::Plain(stream)
+                };
 
-                let mut stream = TcpStream::connect(&proxy_addr).await?;
-
-                let target = format!("{target_host}:{target_port}");
+                let target = match target_host.parse::<IpAddr>() {
+                    Ok(ip) => SocketAddr::new(ip, target_port).to_string(),
+                    Err(_) => format!("{target_host}:{target_port}"),
+                };
                 let mut req = format!(
                     "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n"
                 );
@@ -140,34 +162,183 @@ impl Proxy {
 
                 req.push_str("\r\n");
                 stream.write_all(req.as_bytes()).await?;
+                stream.flush().await?;
 
-                let mut buf = [0u8; 1024 * 16];
-                let n = stream.read(&mut buf).await?;
-                let resp = std::str::from_utf8(&buf[..n])?;
-
-                if !resp.starts_with("HTTP/1.1 200") && !resp.starts_with("HTTP/1.0 200") {
-                    return Err(format!("proxy CONNECT failed: {resp}").into());
-                }
+                read_connect_response(&mut stream).await?;
 
                 Ok(stream)
             }
 
             Proxy::Socks5 { addr, auth } => {
-                let address = addr.as_str();
+                let socket = TcpStream::connect(addr.as_str()).await?;
                 let target = (target_host, target_port);
                 let stream = if let Some(auth) = auth {
-                    Socks5Stream::connect_with_password(
-                        address,
+                    Socks5Stream::connect_with_password_and_socket(
+                        socket,
                         target,
                         &auth.username,
                         &auth.password,
                     )
                     .await?
                 } else {
-                    Socks5Stream::connect(address, target).await?
+                    Socks5Stream::connect_with_socket(socket, target).await?
                 };
-                Ok(stream.into_inner())
+                Ok(ProxyStream::Plain(stream.into_inner()))
             }
         }
+    }
+}
+
+fn validate_http_proxy(uri: &Url) -> io::Result<()> {
+    if !matches!(uri.scheme(), "http" | "https") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported proxy scheme: expected an http:// or https:// CONNECT proxy",
+        ));
+    }
+    if uri.host().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid proxy host",
+        ));
+    }
+    if !uri.username().is_empty() || uri.password().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proxy URL credentials are not supported; use ProxyBuilder::auth() instead",
+        ));
+    }
+    Ok(())
+}
+
+async fn read_connect_response(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    const MAX_HEADER_BYTES: usize = 16 * 1024;
+    let mut response = Vec::with_capacity(256);
+    let mut total_header_bytes = 0;
+    loop {
+        response.clear();
+        while !response.ends_with(b"\r\n\r\n") {
+            if total_header_bytes == MAX_HEADER_BYTES {
+                return Err("proxy CONNECT response headers exceed 16384 bytes".into());
+            }
+            // Consume exactly the headers; any following bytes belong to the tunnel.
+            response.push(stream.read_u8().await?);
+            total_header_bytes += 1;
+        }
+        let mut headers =
+            vec![httparse::EMPTY_HEADER; response.iter().filter(|&&b| b == b'\n').count()];
+        let mut parsed = httparse::Response::new(&mut headers);
+        let status = parsed
+            .parse(&response)
+            .map_err(|error| format!("invalid proxy CONNECT response: {error}"))?;
+        if status.is_partial() {
+            return Err("incomplete proxy CONNECT response".into());
+        }
+        let code = parsed.code.ok_or("missing proxy CONNECT status")?;
+        match code {
+            100..=199 if code != 101 => continue,
+            200..=299 => return Ok(()),
+            _ => return Err(format!("proxy CONNECT failed with HTTP {code}").into()),
+        }
+    }
+}
+
+// Keep ordinary TCP paths unboxed; retain the outer TLS session throughout the tunnel.
+pub(crate) enum ProxyStream {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for ProxyStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ProxyStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            Self::Tls(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Plain(stream) => stream.is_write_vectored(),
+            Self::Tls(stream) => stream.is_write_vectored(),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn connect_response_skips_informational_headers_and_preserves_tunnel_bytes() {
+        timeout(Duration::from_secs(3), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                peer.write_all(
+                    b"HTTP/1.1 100 Continue\r\n\r\n\
+                    HTTP/1.1 103 Early Hints\r\nLink: </test>\r\n\r\n\
+                    HTTP/1.1 200 Connection established\r\n\r\n\x00\xfftunnel",
+                )
+                .await
+                .unwrap();
+            });
+
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            read_connect_response(&mut stream).await.unwrap();
+            let mut trailing = [0; 8];
+            stream.read_exact(&mut trailing).await.unwrap();
+            assert_eq!(&trailing, b"\x00\xfftunnel");
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

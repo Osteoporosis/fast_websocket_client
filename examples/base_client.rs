@@ -18,7 +18,7 @@ async fn subscribe(
         params: vec!["btcusdt@bookTicker".to_string()],
         id: started_at.elapsed().as_nanos(),
     };
-    tokio::time::timeout(Duration::from_millis(0), client.send_json(&data)).await??;
+    client.send_json(&data).await?;
     Ok(())
 }
 
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let future = base_client::connect(url);
             /*
                 alternative code for an example:
-                    1. make a Offline client
+                    1. make an Offline client
                     2. apply an intentional error raising setting before `connect`
                     3. call `connect` to get a future
             */
@@ -79,8 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
-                    println!("timeout");
-                    continue;
+                    println!("receive timed out; discarding the connection");
+                    break;
                 };
 
                 match message.opcode {
@@ -96,7 +96,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("{payload}");
                     }
                     OpCode::Close => {
-                        println!("{:?}", String::from_utf8_lossy(&message.payload[2..]));
+                        let reason = message.payload.get(2..).unwrap_or_default();
+                        println!("{:?}", String::from_utf8_lossy(reason));
                         break 'reconnect_loop;
                     }
                     _ => {}
