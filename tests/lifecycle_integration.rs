@@ -37,10 +37,10 @@ async fn local_close_waits_for_peer_acknowledgment_and_emits_one_close() {
                     let _ = tx.send(());
                 }
             })
-            .on_close(move |_| {
+            .on_close(move |event| {
                 let tx = close_tx.clone();
                 async move {
-                    let _ = tx.send(());
+                    let _ = tx.send(event);
                 }
             })
             .on_error(move |error| {
@@ -75,7 +75,10 @@ async fn local_close_waits_for_peer_acknowledgment_and_emits_one_close() {
         ));
         common::write_frame(&mut peer, true, 8, &close_payload).await;
         shutdown.await.unwrap();
-        assert_eq!(close_rx.recv().await, Some(()));
+        let event = close_rx.recv().await.unwrap();
+        assert_eq!(event.code, 1000);
+        assert!(event.reason.is_empty());
+        assert!(event.was_clean);
         assert_eq!(close_rx.recv().await, None);
         assert!(error_rx.try_recv().is_err());
     })
@@ -142,10 +145,10 @@ async fn local_close_times_out_when_peer_never_acknowledges() {
                     let _ = tx.send(());
                 }
             })
-            .on_close(move |_| {
+            .on_close(move |event| {
                 let tx = close_tx.clone();
                 async move {
-                    let _ = tx.send(());
+                    let _ = tx.send(event);
                 }
             })
             .connect_with_config(&url, ClientConfig::new().with_close_timeout(close_timeout))
@@ -161,7 +164,10 @@ async fn local_close_times_out_when_peer_never_acknowledges() {
             requested_at.elapsed() >= close_timeout,
             "socket dropped before the configured acknowledgment timeout"
         );
-        assert_eq!(close_rx.recv().await, Some(()));
+        let event = close_rx.recv().await.unwrap();
+        assert_eq!(event.code, 1006);
+        assert!(event.reason.is_empty());
+        assert!(!event.was_clean);
         assert_eq!(close_rx.recv().await, None);
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
     })

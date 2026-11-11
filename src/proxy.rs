@@ -44,8 +44,9 @@ impl ProxyBuilder {
     ///
     /// HTTPS proxies use TLS with certificate and hostname verification before
     /// sending the CONNECT request or proxy credentials.
-    /// Returns an error for an invalid URL or unsupported proxy scheme.
-    pub fn http(mut self, uri: &str) -> Result<Self, Box<dyn Error>> {
+    /// Returns an error for an invalid URL, unsupported scheme, or URL credentials.
+    /// Provide credentials with [`Self::auth`] instead.
+    pub fn http(mut self, uri: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let parsed = Url::parse(uri)?;
         validate_http_proxy(&parsed)?;
         self.kind = Some(ProxyKind::Http(parsed));
@@ -71,7 +72,7 @@ impl ProxyBuilder {
     ///
     /// # Errors
     /// * Returns an error if neither `http` nor `socks5` was specified.
-    pub fn build(self) -> Result<Proxy, Box<dyn Error>> {
+    pub fn build(self) -> Result<Proxy, Box<dyn Error + Send + Sync>> {
         match self.kind {
             Some(ProxyKind::Http(uri)) => Ok(Proxy::Http {
                 uri,
@@ -98,6 +99,7 @@ pub struct ProxyAuth {
 /// * `Http` – plain or TLS tunnel via HTTP CONNECT
 /// * `Socks5` – TCP tunnel via SOCKS5 (optionally username/password)
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Proxy {
     Http {
         uri: Url,
@@ -168,18 +170,18 @@ impl Proxy {
             }
 
             Proxy::Socks5 { addr, auth } => {
-                let address = addr.as_str();
+                let socket = TcpStream::connect(addr.as_str()).await?;
                 let target = (target_host, target_port);
                 let stream = if let Some(auth) = auth {
-                    Socks5Stream::connect_with_password(
-                        address,
+                    Socks5Stream::connect_with_password_and_socket(
+                        socket,
                         target,
                         &auth.username,
                         &auth.password,
                     )
                     .await?
                 } else {
-                    Socks5Stream::connect(address, target).await?
+                    Socks5Stream::connect_with_socket(socket, target).await?
                 };
                 Ok(ProxyStream::Plain(stream.into_inner()))
             }
@@ -200,6 +202,12 @@ fn validate_http_proxy(uri: &Url) -> io::Result<()> {
             "invalid proxy host",
         ));
     }
+    if !uri.username().is_empty() || uri.password().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proxy URL credentials are not supported; use ProxyBuilder::auth() instead",
+        ));
+    }
     Ok(())
 }
 
@@ -208,27 +216,33 @@ async fn read_connect_response(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     const MAX_HEADER_BYTES: usize = 16 * 1024;
     let mut response = Vec::with_capacity(256);
-    while !response.ends_with(b"\r\n\r\n") {
-        if response.len() == MAX_HEADER_BYTES {
-            return Err("proxy CONNECT response headers exceed 16384 bytes".into());
+    let mut total_header_bytes = 0;
+    loop {
+        response.clear();
+        while !response.ends_with(b"\r\n\r\n") {
+            if total_header_bytes == MAX_HEADER_BYTES {
+                return Err("proxy CONNECT response headers exceed 16384 bytes".into());
+            }
+            // Consume exactly the headers; any following bytes belong to the tunnel.
+            response.push(stream.read_u8().await?);
+            total_header_bytes += 1;
         }
-        // Consume exactly the headers; any following bytes belong to the tunnel.
-        response.push(stream.read_u8().await?);
+        let mut headers =
+            vec![httparse::EMPTY_HEADER; response.iter().filter(|&&b| b == b'\n').count()];
+        let mut parsed = httparse::Response::new(&mut headers);
+        let status = parsed
+            .parse(&response)
+            .map_err(|error| format!("invalid proxy CONNECT response: {error}"))?;
+        if status.is_partial() {
+            return Err("incomplete proxy CONNECT response".into());
+        }
+        let code = parsed.code.ok_or("missing proxy CONNECT status")?;
+        match code {
+            100..=199 if code != 101 => continue,
+            200..=299 => return Ok(()),
+            _ => return Err(format!("proxy CONNECT failed with HTTP {code}").into()),
+        }
     }
-    let mut headers =
-        vec![httparse::EMPTY_HEADER; response.iter().filter(|&&b| b == b'\n').count()];
-    let mut parsed = httparse::Response::new(&mut headers);
-    let status = parsed
-        .parse(&response)
-        .map_err(|error| format!("invalid proxy CONNECT response: {error}"))?;
-    if status.is_partial() {
-        return Err("incomplete proxy CONNECT response".into());
-    }
-    let code = parsed.code.ok_or("missing proxy CONNECT status")?;
-    if !(200..300).contains(&code) {
-        return Err(format!("proxy CONNECT failed with HTTP {code}").into());
-    }
-    Ok(())
 }
 
 // Keep ordinary TCP paths unboxed; retain the outer TLS session throughout the tunnel.
@@ -302,15 +316,19 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
-    async fn connect_response_preserves_trailing_tunnel_bytes() {
+    async fn connect_response_skips_informational_headers_and_preserves_tunnel_bytes() {
         timeout(Duration::from_secs(3), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut peer, _) = listener.accept().await.unwrap();
-                peer.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n\x00\xfftunnel")
-                    .await
-                    .unwrap();
+                peer.write_all(
+                    b"HTTP/1.1 100 Continue\r\n\r\n\
+                    HTTP/1.1 103 Early Hints\r\nLink: </test>\r\n\r\n\
+                    HTTP/1.1 200 Connection established\r\n\r\n\x00\xfftunnel",
+                )
+                .await
+                .unwrap();
             });
 
             let mut stream = TcpStream::connect(address).await.unwrap();

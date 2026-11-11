@@ -37,6 +37,8 @@
 //!
 //! `on_message` receives text as `String`; `on_binary` receives binary data as `Vec<u8>`.
 //!
+//! `on_close` receives a `CloseEvent` with the close code, reason, and whether the closing handshake completed successfully (`was_clean`).
+//!
 //! ```no_run
 //! // try this example with
 //! // `cargo run --example wss_client`
@@ -54,8 +56,11 @@
 //!         println!("[OPEN] WebSocket connection opened.");
 //!     })
 //!     .await;
-//!     ws.on_close(|_| async move {
-//!         println!("[CLOSE] WebSocket connection closed.");
+//!     ws.on_close(|event| async move {
+//!         println!(
+//!             "[CLOSE] code={}, reason={:?}, clean={}",
+//!             event.code, event.reason, event.was_clean
+//!         );
 //!     })
 //!     .await;
 //!     ws.on_message(|message| async move {
@@ -130,6 +135,7 @@
 //! |-----------------------------------------|------------------------|
 //! | `client::Offline`                       | `base_client::Offline` |
 //! | `client::Online`                        | `base_client::Online`  |
+//! | `on_close` callback argument `()`       | `CloseEvent`; callbacks using `\|_\|` need no change. |
 //! | Runtime settings via `Online`'s methods | Must now be set before connect via `ConnectionInitOptions`.<br>Changes to the running `WebSocket` take effect on the next (re)connection. |
 //!
 //! **New users:** We recommend starting with the `WebSocket` API for best experience.
@@ -153,7 +159,8 @@ pub mod client;
 pub use client as callback_client;
 #[cfg(feature = "callback_client")]
 pub use client::{
-    ClientConfig, ConnectionInitOptions, WebSocket, WebSocketBuilder, WebSocketClientError,
+    ClientConfig, CloseEvent, ConnectionInitOptions, WebSocket, WebSocketBuilder,
+    WebSocketClientError,
 };
 
 #[cfg(feature = "proxy")]

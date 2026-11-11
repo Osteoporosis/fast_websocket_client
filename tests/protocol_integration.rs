@@ -13,6 +13,25 @@ const DEADLINE: Duration = Duration::from_secs(3);
 type TestFrame = (bool, u8, Vec<u8>);
 type ReceiveResult = Result<(OpCode, Vec<u8>), Box<dyn Error + Send + Sync>>;
 
+fn handshake_response(request: &str, status: &str, headers: &str) -> Vec<u8> {
+    let key = request
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("sec-websocket-key")
+                .then_some(value.trim())
+        })
+        .unwrap();
+    let mut request = hyper::Request::builder()
+        .header("Sec-WebSocket-Key", key)
+        .header("Sec-WebSocket-Version", "13")
+        .body(())
+        .unwrap();
+    let (response, _) = fastwebsockets::upgrade::upgrade(&mut request).unwrap();
+    let accept = response.headers()["Sec-WebSocket-Accept"].to_str().unwrap();
+    format!("HTTP/1.1 {status}\r\nSec-WebSocket-Accept: {accept}\r\n{headers}\r\n").into_bytes()
+}
+
 async fn receive(frames: Vec<TestFrame>, limit: usize) -> ReceiveResult {
     let (listener, url) = common::listener().await;
     let server = tokio::spawn(async move {
@@ -35,6 +54,130 @@ async fn receive(frames: Vec<TestFrame>, limit: usize) -> ReceiveResult {
     drop(client);
     timeout(DEADLINE, server).await.unwrap().unwrap();
     received
+}
+
+#[tokio::test]
+async fn handshake_accepts_connection_token_lists_and_preserves_buffered_frames() {
+    for connection in [
+        "Connection: keep-alive, Upgrade\r\n",
+        "Connection: UpGrAdE, keep-alive\r\n",
+        "Connection: keep-alive\r\nConnection: \tUpGrAdE, custom-option\r\n",
+        "Connection: , keep-alive,, Upgrade,\r\n",
+    ] {
+        let (listener, url) = common::listener().await;
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let request = common::read_headers(&mut peer).await;
+            let mut response = handshake_response(
+                &request,
+                "101 Switching Protocols",
+                &format!("Upgrade: WeBsOcKeT\r\n{connection}"),
+            );
+            response.extend_from_slice(b"\x81\x02ok");
+            peer.write_all(&response).await.unwrap();
+            common::reply_until_close(peer).await;
+        });
+        let mut client = timeout(DEADLINE, Offline::new().connect(&url))
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{connection:?}: {error}"));
+        let frame = timeout(DEADLINE, client.receive_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.opcode, OpCode::Text);
+        assert_eq!(&frame.payload[..], b"ok");
+        drop(frame);
+        drop(client);
+        timeout(DEADLINE, server).await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn handshake_rejects_missing_or_invalid_connection_tokens() {
+    for connection in [
+        "",
+        "Connection: \r\n",
+        "Connection: keep-alive, upgrade-extra\r\n",
+        "Connection: notupgrade\r\nConnection: keep-alive\r\n",
+        "Connection: \"Upgrade\"\r\n",
+        "Connection: Upgrade, bad option\r\n",
+        "Connection: Upgrade\r\nConnection: keep-alive; foo=bar\r\n",
+        "Connection: Upgrade, \u{0080}\r\n",
+    ] {
+        let (listener, url) = common::listener().await;
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let request = common::read_headers(&mut peer).await;
+            let response = handshake_response(
+                &request,
+                "101 Switching Protocols",
+                &format!("Upgrade: websocket\r\n{connection}"),
+            );
+            peer.write_all(&response).await.unwrap();
+            common::reply_until_close(peer).await;
+        });
+        let error = timeout(DEADLINE, Offline::new().connect(&url))
+            .await
+            .unwrap()
+            .err()
+            .expect("invalid Connection header was accepted");
+        assert!(
+            matches!(
+                error.downcast_ref::<WebSocketError>(),
+                Some(WebSocketError::InvalidConnectionHeader)
+            ),
+            "{connection:?}: {error}"
+        );
+        timeout(DEADLINE, server).await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn handshake_rejects_invalid_status_and_response_headers() {
+    for (status, headers, expected_error) in [
+        (
+            "200 OK",
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: 0\r\n",
+            "Invalid status code: 200",
+        ),
+        (
+            "101 Switching Protocols",
+            "Connection: Upgrade\r\n",
+            "Invalid upgrade header",
+        ),
+        (
+            "101 Switching Protocols",
+            "Upgrade: h2c\r\nConnection: Upgrade\r\n",
+            "Invalid upgrade header",
+        ),
+        (
+            "101 Switching Protocols",
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: incorrect\r\n",
+            "invalid Sec-WebSocket-Accept",
+        ),
+        (
+            "101 Switching Protocols",
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Extensions: permessage-deflate\r\n",
+            "unsupported WebSocket extension",
+        ),
+    ] {
+        let (listener, url) = common::listener().await;
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let request = common::read_headers(&mut peer).await;
+            let response = handshake_response(&request, status, headers);
+            peer.write_all(&response).await.unwrap();
+            common::reply_until_close(peer).await;
+        });
+        let error = timeout(DEADLINE, Offline::new().connect(&url))
+            .await
+            .unwrap()
+            .err()
+            .expect("invalid handshake was accepted");
+        assert_eq!(error.to_string(), expected_error);
+        timeout(DEADLINE, server).await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -83,25 +226,12 @@ async fn selected_subprotocol_must_be_single_and_previously_offered() {
         let server = tokio::spawn(async move {
             let (mut peer, _) = listener.accept().await.unwrap();
             let headers = common::read_headers(&mut peer).await;
-            let key = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("sec-websocket-key")
-                        .then_some(value.trim())
-                })
-                .unwrap();
-            let mut request = hyper::Request::builder()
-                .header("Sec-WebSocket-Key", key)
-                .header("Sec-WebSocket-Version", "13")
-                .body(())
-                .unwrap();
-            let (response, _) = fastwebsockets::upgrade::upgrade(&mut request).unwrap();
-            let accept = response.headers()["Sec-WebSocket-Accept"].to_str().unwrap();
-            let response = format!(
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{selected}\r\n"
+            let response = handshake_response(
+                &headers,
+                "101 Switching Protocols",
+                &format!("Upgrade: websocket\r\nConnection: Upgrade\r\n{selected}"),
             );
-            peer.write_all(response.as_bytes()).await.unwrap();
+            peer.write_all(&response).await.unwrap();
             common::reply_until_close(peer).await;
         });
         let mut offline = Offline::new();

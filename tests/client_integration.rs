@@ -108,10 +108,10 @@ async fn eof_emits_one_close_and_obeys_reconnect_delay() {
                 let _ = tx.send(());
             }
         })
-        .on_close(move |_| {
+        .on_close(move |event| {
             let tx = close_tx.clone();
             async move {
-                let _ = tx.send(());
+                let _ = tx.send(event);
             }
         })
         .connect_with_config(&url, ClientConfig::new().with_reconnect_delay(delay))
@@ -124,7 +124,10 @@ async fn eof_emits_one_close_and_obeys_reconnect_delay() {
     let disconnected_at = Instant::now();
     first.shutdown().await.unwrap();
     drop(first);
-    timeout(DEADLINE, close_rx.recv()).await.unwrap().unwrap();
+    let event = timeout(DEADLINE, close_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(event.code, 1006);
+    assert!(event.reason.is_empty());
+    assert!(!event.was_clean);
     let second = timeout(DEADLINE, common::accept_ws(&listener))
         .await
         .unwrap();

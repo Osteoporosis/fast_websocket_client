@@ -35,6 +35,7 @@ type VoidCallback = Box<dyn AsyncFnMut<()>>;
 ///
 /// All variants are convertible to string via `Display`.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum WebSocketClientError {
     #[error("Invalid WebSocket URL: {0}")]
     InvalidUrl(String),
@@ -63,13 +64,25 @@ pub enum WebSocketClientError {
     NotConnected,
 }
 
+/// Details of a closed WebSocket connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CloseEvent {
+    /// The peer's close code, or 1005 if omitted, or 1006 if no Close frame arrived.
+    pub code: u16,
+    /// The peer's close reason, or an empty string if none was received.
+    pub reason: String,
+    /// Whether both peers exchanged Close frames successfully.
+    pub was_clean: bool,
+}
+
 /// Holds callback functions that are invoked on specific WebSocket events.
 #[derive(Default)]
 struct CallbackSet {
     /// Called when the connection is successfully established.
     on_open: Option<VoidCallback>,
     /// Called when the connection is closed.
-    on_close: Option<VoidCallback>,
+    on_close: Option<Callback<CloseEvent>>,
     /// Called when an error occurs.
     on_error: Option<Callback<String>>,
     /// Called when a text message is received.
@@ -98,9 +111,9 @@ impl CallbackSet {
             cb.call_mut(message).await;
         }
     }
-    pub async fn call_on_close(&mut self) {
+    pub async fn call_on_close(&mut self, event: CloseEvent) {
         if let Some(cb) = &mut self.on_close {
-            cb.call_mut(()).await;
+            cb.call_mut(event).await;
         }
     }
 }
@@ -110,7 +123,7 @@ enum CallbackUpdate {
     /// Set the callback to be invoked on connection open.
     Open(VoidCallback),
     /// Set the callback to be invoked on connection close.
-    Close(VoidCallback),
+    Close(Callback<CloseEvent>),
     /// Set the callback to be invoked on error.
     Error(Callback<String>),
     /// Set the callback to be invoked on message receive.
@@ -426,7 +439,7 @@ impl WebSocket {
     /// Update the `on_close` callback.
     pub async fn on_close<F, Fut>(&self, f: F) -> &Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
+        F: FnMut(CloseEvent) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.update_callback(CallbackUpdate::Close(Box::new(f)))
@@ -534,7 +547,7 @@ impl WebSocketBuilder {
     /// Registers a callback to be invoked when the connection closes.
     pub fn on_close<F, Fut>(mut self, f: F) -> Self
     where
-        F: FnMut(()) -> Fut + Send + 'static,
+        F: FnMut(CloseEvent) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.callbacks.on_close = Some(Box::new(f));
@@ -722,6 +735,11 @@ async fn run(
                 let mut ping_timer = time::interval(config.ping_interval);
                 let mut closing = None;
                 let mut shutdown = false;
+                let mut close_event = CloseEvent {
+                    code: 1006,
+                    reason: String::new(),
+                    was_clean: false,
+                };
 
                 'connection: loop {
                     let result = {
@@ -774,12 +792,26 @@ async fn run(
                     };
                     match result {
                         Ok(frame) => {
+                            if frame.opcode == OpCode::Close {
+                                if frame.payload.is_empty() {
+                                    close_event.code = 1005;
+                                } else {
+                                    close_event.code =
+                                        u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                                    close_event.reason = std::str::from_utf8(&frame.payload[2..])
+                                        .expect("Close payload was validated by the reader")
+                                        .to_owned();
+                                }
+                            }
                             if let Err(error) = client.writer.respond(&frame).await {
                                 callbacks.call_on_error(error.to_string()).await;
                                 break;
                             }
                             match frame.opcode {
-                                OpCode::Close => break,
+                                OpCode::Close => {
+                                    close_event.was_clean = client.writer.is_closed();
+                                    break;
+                                }
                                 OpCode::Text if !shutdown => {
                                     match String::from_utf8(frame.payload.into()) {
                                         Ok(text) => callbacks.call_on_message(text).await,
@@ -801,7 +833,8 @@ async fn run(
                         }
                     }
                 }
-                callbacks.call_on_close().await;
+                drop(client);
+                callbacks.call_on_close(close_event).await;
                 if shutdown {
                     return;
                 }

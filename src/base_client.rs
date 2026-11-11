@@ -1,4 +1,6 @@
 use base64::Engine;
+use fastwebsockets::{Role, WebSocket, WebSocketError};
+use hyper_util::rt::TokioIo;
 use sha1::{Digest, Sha1};
 
 use crate::connection::{Reader, Writer};
@@ -221,9 +223,9 @@ impl Offline {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name")
                 })?;
                 let tls_stream = tls_connector.connect(server_name, stream).await?;
-                fastwebsockets::handshake::client(&SpawnExecutor, request, tls_stream).await?
+                handshake(request, tls_stream).await?
             }
-            _ => fastwebsockets::handshake::client(&SpawnExecutor, request, stream).await?,
+            _ => handshake(request, stream).await?,
         };
 
         let accept = response.headers().get_all("sec-websocket-accept");
@@ -271,6 +273,71 @@ impl Offline {
             writer: Writer::new(writer, self.auto_close, self.auto_pong),
         })
     }
+}
+
+async fn handshake<S>(
+    request: hyper::Request<http_body_util::Empty<hyper::body::Bytes>>,
+    stream: S,
+) -> Result<
+    (
+        WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
+        hyper::Response<hyper::body::Incoming>,
+    ),
+    WebSocketError,
+>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+    tokio::spawn(async move {
+        let _ = connection.with_upgrades().await;
+    });
+    let mut response = sender.send_request(request).await?;
+    if response.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
+        return Err(WebSocketError::InvalidStatusCode(
+            response.status().as_u16(),
+        ));
+    }
+    if !response
+        .headers()
+        .get(hyper::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    {
+        return Err(WebSocketError::InvalidUpgradeHeader);
+    }
+
+    let mut upgrade = false;
+    for value in response.headers().get_all(hyper::header::CONNECTION) {
+        let value = value
+            .to_str()
+            .map_err(|_| WebSocketError::InvalidConnectionHeader)?;
+        for token in value
+            .split(',')
+            .map(|token| token.trim_matches([' ', '\t']))
+        {
+            if token.is_empty() {
+                continue;
+            }
+            if !token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            {
+                return Err(WebSocketError::InvalidConnectionHeader);
+            }
+            upgrade |= token.eq_ignore_ascii_case("upgrade");
+        }
+    }
+    if !upgrade {
+        return Err(WebSocketError::InvalidConnectionHeader);
+    }
+
+    let upgraded = hyper::upgrade::on(&mut response).await?;
+    Ok((
+        WebSocket::after_handshake(TokioIo::new(upgraded), Role::Client),
+        response,
+    ))
 }
 
 pub(crate) fn parse_url(url: &str) -> Result<url::Url, Box<dyn std::error::Error + Send + Sync>> {
@@ -406,17 +473,5 @@ impl Online {
         ))
         .await?;
         Ok(())
-    }
-}
-
-struct SpawnExecutor;
-
-impl<Fut> hyper::rt::Executor<Fut> for SpawnExecutor
-where
-    Fut: std::future::Future + Send + 'static,
-    Fut::Output: Send + 'static,
-{
-    fn execute(&self, future: Fut) {
-        tokio::task::spawn(future);
     }
 }
