@@ -6,6 +6,7 @@ use tokio::time::{Duration, sleep};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
+    // Starts connecting in the background; results arrive through callbacks.
     let ws = WebSocket::new("wss://echo.websocket.org").await?;
 
     ws.on_open(|_| async move {
@@ -20,8 +21,17 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
         println!("[MESSAGE] {}", message);
     })
     .await;
+    ws.on_binary(|bytes| async move {
+        println!("[BINARY] {:?}", bytes);
+    })
+    .await;
+    ws.on_error(|error| async move {
+        eprintln!("[ERROR] {}", error);
+    })
+    .await;
 
     sleep(Duration::from_secs(2)).await;
+    ws.send_binary(&[0, 1, 255]).await?;
     for i in 1..5 {
         let message = format!("#{}", i);
         if let Err(e) = ws.send(&message).await {
@@ -33,7 +43,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     }
 
     ws.close().await;
-    ws.await_shutdown().await;
+    ws.await_shutdown().await?;
     Ok(())
 }
 
@@ -52,6 +62,7 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
 
     async function main() {
       const ws = new WebSocket("wss://echo.websocket.org");
+      ws.binaryType = "arraybuffer";
 
       ws.onopen = () => {
         console.log("[OPEN] WebSocket connection opened.");
@@ -60,10 +71,18 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
         console.log("[CLOSE] WebSocket connection closed.");
       };
       ws.onmessage = (event) => {
-        console.log("[MESSAGE]", event.data);
+        if (typeof event.data === "string") {
+          console.log("[MESSAGE]", event.data);
+        } else {
+          console.log("[BINARY]", new Uint8Array(event.data));
+        }
+      };
+      ws.onerror = (event) => {
+        console.error("[ERROR]", event);
       };
 
       await sleep(2000);
+      ws.send(new Uint8Array([0, 1, 255]));
       for (let i = 1; i < 5; i++) {
         const message = `#${i}`;
         try {
