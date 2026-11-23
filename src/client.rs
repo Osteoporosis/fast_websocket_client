@@ -1,11 +1,15 @@
-use std::collections::VecDeque;
+//! JavaScript-like WebSocket callbacks with automatic reconnection.
+
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use fastwebsockets::{CloseCode, FragmentCollectorRead, Frame, WebSocketError, WebSocketWrite};
+use futures_util::{Stream, TryStreamExt, stream};
 use thiserror::Error;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time;
 
@@ -31,9 +35,7 @@ where
 type Callback<T> = Box<dyn AsyncFnMut<T>>;
 type VoidCallback = Box<dyn AsyncFnMut<()>>;
 
-/// Error type returned by high-level [`WebSocket`] API.
-///
-/// All variants are convertible to string via `Display`.
+/// Errors returned by the high-level [`WebSocket`] API.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum WebSocketClientError {
@@ -68,7 +70,7 @@ pub enum WebSocketClientError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CloseEvent {
-    /// The peer's close code, or 1005 if omitted, or 1006 if no Close frame arrived.
+    /// The peer's close code, 1005 if omitted, or 1006 if no valid Close frame was received.
     pub code: u16,
     /// The peer's close reason, or an empty string if none was received.
     pub reason: String,
@@ -76,16 +78,11 @@ pub struct CloseEvent {
     pub was_clean: bool,
 }
 
-/// Holds callback functions that are invoked on specific WebSocket events.
 #[derive(Default)]
 struct CallbackSet {
-    /// Called when the connection is successfully established.
     on_open: Option<VoidCallback>,
-    /// Called when the connection is closed.
     on_close: Option<Callback<CloseEvent>>,
-    /// Called when an error occurs.
     on_error: Option<Callback<String>>,
-    /// Called when a text message is received.
     on_message: Option<Callback<String>>,
     on_binary: Option<Callback<Vec<u8>>>,
 }
@@ -118,32 +115,25 @@ impl CallbackSet {
     }
 }
 
-/// Represents updates to callback functions.
 enum CallbackUpdate {
-    /// Set the callback to be invoked on connection open.
     Open(VoidCallback),
-    /// Set the callback to be invoked on connection close.
     Close(Callback<CloseEvent>),
-    /// Set the callback to be invoked on error.
     Error(Callback<String>),
-    /// Set the callback to be invoked on message receive.
     Message(Callback<String>),
     Binary(Callback<Vec<u8>>),
 }
 
-/// Configuration options for the WebSocket client runtime behavior.
+/// Ping, reconnect, and timeout settings for the callback client.
+///
+/// | Setting | Default | Applies to |
+/// | --- | --- | --- |
+/// | [Ping interval](Self::with_ping_interval) | 30 s | Heartbeats on an open connection |
+/// | [Reconnect delay](Self::with_reconnect_delay) | 10 s | The wait after a failed connection attempt |
+/// | [Connect timeout](Self::with_connect_timeout) | 10 s | Establishing one connection |
+/// | [Close timeout](Self::with_close_timeout) | 5 s | Completing a locally requested closing handshake |
 pub struct ClientConfig {
-    /// Interval at which ping frames are sent.
-    ///
-    /// **Default**: 30 seconds
     ping_interval: Duration,
-    /// Delay before attempting to reconnect after a disconnection.
-    ///
-    /// **Default**: 10 seconds
     reconnect_delay: Duration,
-    /// Maximum time to wait when establishing a connection.
-    ///
-    /// **Default**: 10 seconds
     connect_timeout: Duration,
     close_timeout: Duration,
 }
@@ -166,6 +156,14 @@ impl ClientConfig {
                 "ping_interval must be nonzero".into(),
             ));
         }
+        if time::Instant::now()
+            .checked_add(self.ping_interval)
+            .is_none()
+        {
+            return Err(WebSocketClientError::InvalidConfig(
+                "ping_interval exceeds the supported clock range".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -175,18 +173,13 @@ impl ClientConfig {
         self
     }
 
-    /// Creates a new default configuration.
-    ///
-    /// - `ping_interval`: 30 seconds  
-    /// - `reconnect_delay`: 10 seconds
-    /// - `connect_timeout`: 10 seconds
-    /// - `close_timeout`: 5 seconds
+    /// Creates the default client configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Sets the ping interval duration.
-    /// The interval must be nonzero.
+    /// The interval must be nonzero and fit the platform clock.
     ///
     /// **Default**: 30 seconds
     pub fn with_ping_interval(mut self, interval: Duration) -> Self {
@@ -194,7 +187,7 @@ impl ClientConfig {
         self
     }
 
-    /// Sets the reconnect delay duration.
+    /// Sets the delay after a failed connection attempt.
     ///
     /// **Default**: 10 seconds
     pub fn with_reconnect_delay(mut self, delay: Duration) -> Self {
@@ -211,9 +204,12 @@ impl ClientConfig {
     }
 }
 
-/// Options applied _per connection attempt_.
+/// Options for opening a connection, including handshake headers and the proxy.
+/// Use [`WebSocketBuilder::with_options`] for the first attempt and
+/// [`WebSocket::update_options`] to change future attempts.
 ///
 /// # Defaults
+///
 /// - `vectored`: `true`  
 /// - `max_message_size`: `64 MiB`  
 /// - `auto_close`: `true`  
@@ -260,7 +256,7 @@ impl ConnectionInitOptions {
         self
     }
 
-    /// Sets the maximum allowed message size in bytes.
+    /// Sets the maximum size in bytes of a text or binary message delivered to a callback.
     ///
     /// **Default**: `64 MiB`
     pub fn max_message_size(mut self, value: usize) -> Self {
@@ -268,7 +264,7 @@ impl ConnectionInitOptions {
         self
     }
 
-    /// Enables or disables automatic connection closing on close frames.
+    /// Whether to reply to the peer's Close before ending the session.
     ///
     /// **Default**: `true`
     pub fn auto_close(mut self, value: bool) -> Self {
@@ -300,10 +296,7 @@ impl ConnectionInitOptions {
         self
     }
 
-    /// Sets the proxy configuration to use when establishing the connection.
-    ///
-    /// This method accepts a fully constructed [`Proxy`] instance, usually created
-    /// using [`ProxyBuilder`](crate::proxy::ProxyBuilder). Supports both HTTP and SOCKS5 proxies.
+    /// Sets a proxy for the connection. See [`ProxyBuilder`](crate::proxy::ProxyBuilder).
     ///
     /// # Example
     ///
@@ -324,80 +317,72 @@ impl ConnectionInitOptions {
     }
 }
 
-/// Messages sent from the public handle (`WebSocket`) to the
-/// background task running in [`run`].
 enum ClientCommand {
-    /// Close the connection.
-    Close,
-    /// Update client configuration.
     UpdateConfig(ClientConfig),
-    /// Update connection initialization options.
     UpdateOptions(Box<ConnectionInitOptions>),
-    /// Update callback handlers.
     UpdateCallback(CallbackUpdate),
-    /// Send a text message.
-    SendMessage(String),
-    SendBinary(Vec<u8>),
+    Send(Frame<'static>),
 }
 
-/// Represents a WebSocket client instance.
+struct Senders {
+    commands: mpsc::UnboundedSender<ClientCommand>,
+    // Dropping the handle also interrupts a handshake or retry delay.
+    _stop: oneshot::Sender<()>,
+}
+
+/// A reconnecting WebSocket with asynchronous event handlers.
+///
+/// Handlers stay registered across reconnects until replaced. One task awaits each
+/// handler before processing the next event.
+///
+/// When an open connection ends, the client calls [`on_close`](Self::on_close)
+/// and immediately tries to reconnect unless [`close`](Self::close) was requested.
+/// Failed connection attempts call [`on_error`](Self::on_error) and wait for the
+/// [configured retry delay](ClientConfig::with_reconnect_delay).
 pub struct WebSocket {
     task_handle: JoinHandle<()>,
-    command_tx: mpsc::UnboundedSender<ClientCommand>,
+    senders: Mutex<Option<Senders>>,
 }
 
 impl WebSocket {
-    /// Starts connecting in the background and returns a new [`WebSocket`] handle.
-    /// Connection results are delivered through callbacks; this does not wait for a handshake.
-    ///
-    /// This is a convenience method that delegates to [`WebSocketBuilder`].
-    ///
-    /// # Arguments
-    ///
-    /// * `url` - A string slice representing the WebSocket server URL.
+    /// Starts connecting in the background and returns a handle for registering callbacks.
+    /// Use [`WebSocketBuilder`] when a handler must observe the first connection event
+    /// on any Tokio runtime.
     ///
     /// # Errors
     ///
-    /// Returns an error for an invalid URL or configuration. Network errors use `on_error`.
+    /// Returns [`WebSocketClientError::InvalidUrl`] for an invalid URL. A connection
+    /// or handshake failure is reported to [`on_error`](Self::on_error).
     ///
     /// # Example
     ///
     /// ```no_run
-    /// use fast_websocket_client::WebSocket;
+    /// use fast_websocket_client::{WebSocket, WebSocketClientError};
+    /// use std::time::Duration;
+    /// use tokio::{sync::mpsc, time::timeout};
     ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
-    ///     let socket = WebSocket::connect("wss://echo.websocket.org").await?;
-    ///     let _ = socket;
-    ///     Ok(())
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> Result<(), WebSocketClientError> {
+    ///     let ws = WebSocket::connect("wss://echo.websocket.org").await?;
+    ///     let (tx, mut messages) = mpsc::unbounded_channel();
+    ///     ws.on_message(move |text| {
+    ///         let tx = tx.clone();
+    ///         async move { let _ = tx.send(text); }
+    ///     }).await;
+    ///
+    ///     ws.send("hello").await?;
+    ///     if let Ok(Some(text)) = timeout(Duration::from_secs(5), messages.recv()).await {
+    ///         println!("{text}");
+    ///     }
+    ///     ws.close().await;
+    ///     ws.await_shutdown().await
     /// }
     /// ```
     pub async fn connect(url: &str) -> Result<Self, WebSocketClientError> {
         WebSocketBuilder::new().connect(url).await
     }
 
-    /// Alias for [`WebSocket::connect`]. Initializes a new [`WebSocket`] connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `url` - A string slice representing the WebSocket server URL.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid URL or configuration. Network errors use `on_error`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use fast_websocket_client::WebSocket;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
-    ///     let socket = WebSocket::new("wss://echo.websocket.org").await?;
-    ///     let _ = socket;
-    ///     Ok(())
-    /// }
-    /// ```
+    /// Alias for [`WebSocket::connect`].
     pub async fn new(url: &str) -> Result<Self, WebSocketClientError> {
         Self::connect(url).await
     }
@@ -407,25 +392,24 @@ impl WebSocket {
     /// previous configuration in place. An ongoing connection attempt, retry
     /// wait, or close handshake keeps the timeout it started with.
     pub async fn update_config(&self, config: ClientConfig) -> &Self {
-        let _ = self.command_tx.send(ClientCommand::UpdateConfig(config));
+        let _ = self.post(|| ClientCommand::UpdateConfig(config));
         self
     }
 
-    /// Updates the connection initialization options.
+    /// Updates the options for the next connection attempt.
+    /// Invalid options are reported through the error callback.
     pub async fn update_options(&self, opts: ConnectionInitOptions) -> &Self {
-        let _ = self
-            .command_tx
-            .send(ClientCommand::UpdateOptions(Box::new(opts)));
+        let _ = self.post(|| ClientCommand::UpdateOptions(Box::new(opts)));
         self
     }
 
     /// Updates the callback handlers.
     async fn update_callback(&self, cb: CallbackUpdate) -> &Self {
-        let _ = self.command_tx.send(ClientCommand::UpdateCallback(cb));
+        let _ = self.post(|| ClientCommand::UpdateCallback(cb));
         self
     }
 
-    /// Update the `on_open` callback.
+    /// Sets the handler called after each successful handshake, including reconnects.
     pub async fn on_open<F, Fut>(&self, f: F) -> &Self
     where
         F: FnMut(()) -> Fut + Send + 'static,
@@ -436,7 +420,7 @@ impl WebSocket {
         self
     }
 
-    /// Update the `on_close` callback.
+    /// Sets the handler that receives a [`CloseEvent`] when an established connection ends.
     pub async fn on_close<F, Fut>(&self, f: F) -> &Self
     where
         F: FnMut(CloseEvent) -> Fut + Send + 'static,
@@ -447,7 +431,7 @@ impl WebSocket {
         self
     }
 
-    /// Update the `on_error` callback.
+    /// Sets the handler for connection, transport, and runtime configuration errors.
     pub async fn on_error<F, Fut>(&self, f: F) -> &Self
     where
         F: FnMut(String) -> Fut + Send + 'static,
@@ -458,7 +442,7 @@ impl WebSocket {
         self
     }
 
-    /// Update the `on_message` callback.
+    /// Sets the handler for complete text messages. See [`Self::on_binary`] for binary data.
     pub async fn on_message<F, Fut>(&self, f: F) -> &Self
     where
         F: FnMut(String) -> Fut + Send + 'static,
@@ -469,7 +453,7 @@ impl WebSocket {
         self
     }
 
-    /// Update the binary-message callback.
+    /// Sets the handler for complete binary messages.
     pub async fn on_binary<F, Fut>(&self, f: F) -> &Self
     where
         F: FnMut(Vec<u8>) -> Fut + Send + 'static,
@@ -480,40 +464,62 @@ impl WebSocket {
         self
     }
 
-    /// Stops reconnecting and closes the current connection, if any.
+    /// Requests shutdown and stops reconnecting. While the connection stays open,
+    /// earlier sends are processed before the Close frame. Pending sends are discarded
+    /// if the client stops while disconnected. Use [`Self::await_shutdown`] to wait for completion.
     pub async fn close(&self) -> &Self {
-        let _ = self.command_tx.send(ClientCommand::Close);
+        self.senders.lock().unwrap().take();
         self
     }
 
-    /// Awaits shutdown of the WebSocket task and reports a task panic or cancellation.
+    /// Waits for shutdown and reports a task panic or cancellation.
+    /// Call [`Self::close`] first to stop this reconnecting client.
     pub async fn await_shutdown(self) -> Result<(), WebSocketClientError> {
         self.task_handle
             .await
             .map_err(|e| WebSocketClientError::TaskError(e.to_string()))
     }
 
-    /// Sends a text message over the connection.
+    /// Sends a text message. You can send before the connection opens.
+    /// Text and binary messages are sent in the order submitted.
     ///
     /// # Errors
     ///
-    /// Returns [`WebSocketClientError::SendError`] if the message could not be sent.
+    /// Returns [`WebSocketClientError::SendError`] once shutdown has been requested
+    /// or the driver has exited. Transport errors are delivered to the error callback.
     pub async fn send(&self, message: &str) -> Result<(), WebSocketClientError> {
-        self.command_tx
-            .send(ClientCommand::SendMessage(message.to_string()))
-            .map_err(|e| WebSocketClientError::SendError(e.to_string()))
+        self.post(|| ClientCommand::Send(Frame::text(message.as_bytes().to_vec().into())))
     }
 
-    /// Sends a binary message over the connection.
+    /// Sends a binary message with the same ordering and error behavior as [`Self::send`].
     pub async fn send_binary(&self, message: &[u8]) -> Result<(), WebSocketClientError> {
-        self.command_tx
-            .send(ClientCommand::SendBinary(message.to_vec()))
-            .map_err(|e| WebSocketClientError::SendError(e.to_string()))
+        self.post(|| ClientCommand::Send(Frame::binary(message.to_vec().into())))
+    }
+
+    // Order concurrent sends and close under the same lock.
+    fn post(&self, command: impl FnOnce() -> ClientCommand) -> Result<(), WebSocketClientError> {
+        let guard = self.senders.lock().unwrap();
+        let closed = || WebSocketClientError::SendError("client is closed".into());
+        let senders = guard.as_ref().ok_or_else(closed)?;
+        senders.commands.send(command()).map_err(|_| closed())
     }
 }
 
-/// Builder for [`WebSocket`] that lets you register callbacks
-/// **before** the first connection attempt.
+/// Installs handlers and connection options before the first connection attempt.
+///
+/// Use the builder when the first [`on_open`](Self::on_open) or [`on_error`](Self::on_error)
+/// matters. [`connect`](Self::connect) starts the client with the registered handlers.
+///
+/// ```
+/// use fast_websocket_client::{ConnectionInitOptions, HeaderMap, WebSocketBuilder};
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert("Sec-WebSocket-Protocol", "chat".parse().unwrap());
+/// let builder = WebSocketBuilder::new()
+///     .with_options(ConnectionInitOptions::new().custom_headers(headers))
+///     .on_open(|_| async { println!("connected") })
+///     .on_error(|error| async move { eprintln!("{error}") });
+/// ```
 pub struct WebSocketBuilder {
     callbacks: CallbackSet,
     options: ConnectionInitOptions,
@@ -590,20 +596,13 @@ impl WebSocketBuilder {
         self
     }
 
-    /// Starts a background connection attempt using default client configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid URL or configuration. Network errors use `on_error`.
+    /// Starts connecting in the background using the default [`ClientConfig`].
     pub async fn connect(self, url: &str) -> Result<WebSocket, WebSocketClientError> {
         self.connect_with_config(url, ClientConfig::new()).await
     }
 
-    /// Starts a background connection attempt using a specific client configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid URL or configuration. Network errors use `on_error`.
+    /// Starts connecting in the background with the given configuration.
+    /// URL and configuration errors are returned here. Connection failures use `on_error`.
     pub async fn connect_with_config(
         self,
         url: &str,
@@ -611,271 +610,289 @@ impl WebSocketBuilder {
     ) -> Result<WebSocket, WebSocketClientError> {
         base_client::parse_url(url).map_err(|e| WebSocketClientError::InvalidUrl(e.to_string()))?;
         config.validate()?;
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-
-        let url = url.to_owned();
-
-        let task_handle = tokio::spawn(async move {
-            run(&url, config, self.options, self.callbacks, command_rx).await;
-        });
-
+        base_client::validate_headers(&self.options.custom_headers)
+            .map_err(|err| WebSocketClientError::InvalidConfig(err.to_string()))?;
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let (stop, stopped) = oneshot::channel();
+        let driver = Driver {
+            config,
+            options: self.options,
+            callbacks: self.callbacks,
+            commands: receiver,
+            stopped,
+            first_send: None,
+        };
         Ok(WebSocket {
-            command_tx,
-            task_handle,
+            task_handle: tokio::spawn(driver.run(url.to_owned())),
+            senders: Mutex::new(Some(Senders {
+                commands,
+                _stop: stop,
+            })),
         })
     }
 }
 
-async fn apply_update(
-    command: ClientCommand,
-    config: &mut ClientConfig,
-    options: &mut ConnectionInitOptions,
-    callbacks: &mut CallbackSet,
-) -> Option<ClientCommand> {
-    match command {
-        ClientCommand::UpdateConfig(value) => match value.validate() {
-            Ok(()) => *config = value,
-            Err(error) => callbacks.call_on_error(error.to_string()).await,
-        },
-        ClientCommand::UpdateOptions(value) => *options = *value,
-        ClientCommand::UpdateCallback(update) => match update {
-            CallbackUpdate::Open(f) => callbacks.on_open = Some(f),
-            CallbackUpdate::Close(f) => callbacks.on_close = Some(f),
-            CallbackUpdate::Error(f) => callbacks.on_error = Some(f),
-            CallbackUpdate::Message(f) => callbacks.on_message = Some(f),
-            CallbackUpdate::Binary(f) => callbacks.on_binary = Some(f),
-        },
-        other => return Some(other),
-    }
-    None
+struct Driver {
+    config: ClientConfig,
+    options: ConnectionInitOptions,
+    callbacks: CallbackSet,
+    commands: mpsc::UnboundedReceiver<ClientCommand>,
+    stopped: oneshot::Receiver<()>,
+    // Later commands stay in the channel until this message can be sent.
+    first_send: Option<Frame<'static>>,
 }
 
-// Connecting and retry waits accept updates and cancellation. Sends stay FIFO
-// until a connection is available; on_open never reorders them.
-async fn wait_with_commands<T>(
-    future: impl Future<Output = T>,
-    config: &mut ClientConfig,
-    options: &mut ConnectionInitOptions,
-    callbacks: &mut CallbackSet,
-    rx: &mut mpsc::UnboundedReceiver<ClientCommand>,
-    pending: &mut VecDeque<ClientCommand>,
-) -> Option<T> {
-    let mut future = std::pin::pin!(future);
-    loop {
-        tokio::select! {
-            result = &mut future => return Some(result),
-            command = rx.recv() => {
-                let command = command?;
-                match apply_update(command, config, options, callbacks).await {
-                    Some(ClientCommand::Close) => return None,
-                    Some(message) => pending.push_back(message),
-                    None => {},
+impl Driver {
+    async fn apply_command(&mut self, command: ClientCommand) -> Option<Frame<'static>> {
+        match command {
+            ClientCommand::Send(frame) => return Some(frame),
+            ClientCommand::UpdateConfig(config) => match config.validate() {
+                Ok(()) => self.config = config,
+                Err(error) => self.callbacks.call_on_error(error.to_string()).await,
+            },
+            ClientCommand::UpdateOptions(options) => {
+                match base_client::validate_headers(&options.custom_headers) {
+                    Ok(()) => self.options = *options,
+                    Err(error) => self.callbacks.call_on_error(error.to_string()).await,
+                }
+            }
+            ClientCommand::UpdateCallback(update) => match update {
+                CallbackUpdate::Open(f) => self.callbacks.on_open = Some(f),
+                CallbackUpdate::Close(f) => self.callbacks.on_close = Some(f),
+                CallbackUpdate::Error(f) => self.callbacks.on_error = Some(f),
+                CallbackUpdate::Message(f) => self.callbacks.on_message = Some(f),
+                CallbackUpdate::Binary(f) => self.callbacks.on_binary = Some(f),
+            },
+        }
+        None
+    }
+
+    async fn apply_queued_updates(&mut self) {
+        for _ in 0..self.commands.len() {
+            if self.first_send.is_some() {
+                break;
+            }
+            let Ok(command) = self.commands.try_recv() else {
+                break;
+            };
+            self.first_send = self.apply_command(command).await;
+        }
+    }
+
+    // Even with a send waiting for a connection, close can interrupt this wait.
+    async fn while_disconnected<T>(&mut self, future: impl Future<Output = T>) -> Option<T> {
+        let mut future = std::pin::pin!(future);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut self.stopped => return None,
+                result = &mut future => return Some(result),
+                command = self.commands.recv(), if self.first_send.is_none() => {
+                    self.first_send = self.apply_command(command?).await;
                 }
             }
         }
     }
-}
 
-async fn next_command(
-    pending: &mut VecDeque<ClientCommand>,
-    rx: &mut mpsc::UnboundedReceiver<ClientCommand>,
-) -> Option<ClientCommand> {
-    match pending.pop_front() {
-        Some(command) => Some(command),
-        None => rx.recv().await,
-    }
-}
-
-async fn run(
-    url: &str,
-    mut config: ClientConfig,
-    mut options: ConnectionInitOptions,
-    mut callbacks: CallbackSet,
-    mut command_rx: mpsc::UnboundedReceiver<ClientCommand>,
-) {
-    let mut pending = VecDeque::new();
-    loop {
-        let attempt_options = options.clone();
-        let connecting = try_connect(url, &attempt_options, config.connect_timeout);
-        let Some(result) = wait_with_commands(
-            connecting,
-            &mut config,
-            &mut options,
-            &mut callbacks,
-            &mut command_rx,
-            &mut pending,
-        )
-        .await
-        else {
-            return;
-        };
-        match result {
-            Err(error) => callbacks.call_on_error(error.to_string()).await,
-            Ok(mut client) => {
-                // Apply registrations already queued before the first send.
-                loop {
-                    match command_rx.try_recv() {
-                        Ok(command) => {
-                            if let Some(message) =
-                                apply_update(command, &mut config, &mut options, &mut callbacks)
-                                    .await
-                            {
-                                pending.push_back(message);
-                                break;
-                            }
-                        }
-                        Err(mpsc::error::TryRecvError::Empty) => break,
-                        Err(mpsc::error::TryRecvError::Disconnected) => {
-                            pending.push_back(ClientCommand::Close);
-                            break;
-                        }
+    async fn run(mut self, url: String) {
+        while !self.commands.is_closed() {
+            // Pick up option changes before taking this attempt's snapshot.
+            self.apply_queued_updates().await;
+            let options = self.options.clone();
+            let connecting = try_connect(&url, &options, self.config.connect_timeout);
+            let Some(result) = self.while_disconnected(connecting).await else {
+                return;
+            };
+            // Include handlers registered while this attempt was in progress.
+            tokio::task::yield_now().await;
+            self.apply_queued_updates().await;
+            if self.commands.is_closed() {
+                return;
+            }
+            match result {
+                Err(error) => {
+                    self.callbacks.call_on_error(error.to_string()).await;
+                    let delay = time::sleep(self.config.reconnect_delay);
+                    if self.while_disconnected(delay).await.is_none() {
+                        return;
                     }
                 }
-                callbacks.call_on_open().await;
-                let mut ping_timer = time::interval(config.ping_interval);
-                let mut closing = None;
-                let mut shutdown = false;
-                let mut close_event = CloseEvent {
-                    code: 1006,
-                    reason: String::new(),
-                    was_clean: false,
-                };
-
-                'connection: loop {
-                    let result = {
-                        // A command may win select without discarding this read.
-                        let mut receive = std::pin::pin!(client.reader.read());
-                        loop {
-                            tokio::select! {
-                                result = &mut receive => break result,
-                                _ = time::sleep_until(closing.unwrap_or_else(time::Instant::now)), if closing.is_some() => {
-                                    break 'connection;
-                                }
-                                _ = ping_timer.tick(), if !shutdown => {
-                                    if let Err(error) = client.writer.write(fastwebsockets::Frame::new(true, OpCode::Ping, None, (&b""[..]).into())).await {
-                                        callbacks.call_on_error(error.to_string()).await;
-                                        break 'connection;
-                                    }
-                                }
-                                command = next_command(&mut pending, &mut command_rx), if !shutdown => {
-                                    let previous_ping = config.ping_interval;
-                                    let command = match command {
-                                        Some(command) => apply_update(command, &mut config, &mut options, &mut callbacks).await,
-                                        None => Some(ClientCommand::Close),
-                                    };
-                                    if previous_ping != config.ping_interval { ping_timer = time::interval(config.ping_interval); }
-                                    let frame = match command {
-                                        Some(ClientCommand::Close) => {
-                                            shutdown = true;
-                                            let deadline = time::Instant::now() + config.close_timeout;
-                                            closing = Some(deadline);
-                                            let result = time::timeout_at(deadline, client.writer.write(fastwebsockets::Frame::close(1000, b""))).await;
-                                            match result {
-                                                Ok(Ok(())) => {},
-                                                Ok(Err(error)) => { callbacks.call_on_error(error.to_string()).await; break 'connection; }
-                                                Err(_) => break 'connection,
-                                            }
-                                            continue;
-                                        }
-                                        Some(ClientCommand::SendMessage(message)) => fastwebsockets::Frame::text(message.into_bytes().into()),
-                                        Some(ClientCommand::SendBinary(message)) => fastwebsockets::Frame::binary(message.into()),
-                                        None => continue,
-                                        _ => unreachable!(),
-                                    };
-                                    if let Err(error) = client.writer.write(frame).await {
-                                        callbacks.call_on_error(error.to_string()).await;
-                                        break 'connection;
-                                    }
-                                }
-                            }
+                Ok(socket) => {
+                    self.callbacks.call_on_open().await;
+                    let event = match self.session(socket, &options).await {
+                        Ok(event) => event,
+                        Err(error) => {
+                            self.callbacks.call_on_error(error.to_string()).await;
+                            CloseEvent::abnormal()
                         }
                     };
-                    match result {
-                        Ok(frame) => {
-                            if frame.opcode == OpCode::Close {
-                                if frame.payload.is_empty() {
-                                    close_event.code = 1005;
-                                } else {
-                                    close_event.code =
-                                        u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
-                                    close_event.reason = std::str::from_utf8(&frame.payload[2..])
-                                        .expect("Close payload was validated by the reader")
-                                        .to_owned();
-                                }
-                            }
-                            if let Err(error) = client.writer.respond(&frame).await {
-                                callbacks.call_on_error(error.to_string()).await;
-                                break;
-                            }
-                            match frame.opcode {
-                                OpCode::Close => {
-                                    close_event.was_clean = client.writer.is_closed();
-                                    break;
-                                }
-                                OpCode::Text if !shutdown => {
-                                    match String::from_utf8(frame.payload.into()) {
-                                        Ok(text) => callbacks.call_on_message(text).await,
-                                        Err(error) => {
-                                            callbacks.call_on_error(error.to_string()).await;
-                                            break;
-                                        }
-                                    }
-                                }
-                                OpCode::Binary if !shutdown => {
-                                    callbacks.call_on_binary(frame.payload.into()).await
-                                }
-                                _ => {}
-                            }
-                        }
-                        Err(error) => {
-                            callbacks.call_on_error(error.to_string()).await;
-                            break;
-                        }
-                    }
-                }
-                drop(client);
-                callbacks.call_on_close(close_event).await;
-                if shutdown {
-                    return;
+                    self.callbacks.call_on_close(event).await;
                 }
             }
         }
-        let delay = time::sleep(config.reconnect_delay);
-        if wait_with_commands(
-            delay,
-            &mut config,
-            &mut options,
-            &mut callbacks,
-            &mut command_rx,
-            &mut pending,
-        )
-        .await
-        .is_none()
-        {
-            return;
+    }
+
+    async fn session(
+        &mut self,
+        socket: base_client::Socket,
+        options: &ConnectionInitOptions,
+    ) -> Result<CloseEvent, WebSocketError> {
+        let (reader, mut writer) = socket.split(tokio::io::split);
+        // Keep a partial frame read alive when a command or heartbeat wins select.
+        let frames = stream::try_unfold(
+            FragmentCollectorRead::new(reader),
+            |mut reader| async move {
+                let frame: Frame<'static> = reader
+                    .read_frame(&mut |_| std::future::ready(Ok::<_, WebSocketError>(())))
+                    .await?;
+                Ok(Some((frame, reader)))
+            },
+        );
+        let mut frames = std::pin::pin!(frames);
+
+        if let Some(first) = self.first_send.take() {
+            send_frame(&mut writer, first).await?;
+        }
+        let mut ping = time::interval(self.config.ping_interval);
+        loop {
+            tokio::select! {
+                incoming = frames.try_next() => {
+                    let frame = incoming?.ok_or(WebSocketError::ConnectionClosed)?;
+                    base_client::check_message_size(&frame, options.max_message_size)?;
+                    match frame.opcode {
+                        OpCode::Close => {
+                            return self.peer_close(&mut writer, frame, options.auto_close).await;
+                        }
+                        OpCode::Text => {
+                            let text = String::from_utf8(frame.payload.into()).map_err(|_| WebSocketError::InvalidUTF8)?;
+                            self.callbacks.call_on_message(text).await;
+                        }
+                        OpCode::Binary => self.callbacks.call_on_binary(frame.payload.into()).await,
+                        OpCode::Ping => send_frame(&mut writer, Frame::pong(frame.payload)).await?,
+                        _ => {}
+                    }
+                }
+                command = self.commands.recv() => {
+                    let Some(command) = command else {
+                        return close_session(&mut writer, &mut frames, self.config.close_timeout).await;
+                    };
+                    let previous_ping = self.config.ping_interval;
+                    if let Some(frame) = self.apply_command(command).await {
+                        send_frame(&mut writer, frame).await?;
+                    }
+                    if previous_ping != self.config.ping_interval {
+                        ping = time::interval(self.config.ping_interval);
+                    }
+                }
+                _ = ping.tick() => send_frame(&mut writer, Frame::new(true, OpCode::Ping, None, (&b""[..]).into())).await?,
+            }
         }
     }
+
+    async fn peer_close(
+        &mut self,
+        writer: &mut Writer,
+        frame: Frame<'_>,
+        auto_close: bool,
+    ) -> Result<CloseEvent, WebSocketError> {
+        let mut event = match CloseEvent::from_peer(&frame.payload, false) {
+            Ok(event) => event,
+            Err(error) => {
+                if auto_close {
+                    let code = if matches!(error, WebSocketError::InvalidUTF8) {
+                        1007
+                    } else {
+                        1002
+                    };
+                    let _ = send_frame(writer, Frame::close(code, b"")).await;
+                }
+                return Err(error);
+            }
+        };
+        if auto_close {
+            match send_frame(writer, Frame::close_raw(frame.payload)).await {
+                Ok(()) => event.was_clean = true,
+                Err(error) => self.callbacks.call_on_error(error.to_string()).await,
+            }
+        }
+        Ok(event)
+    }
+}
+
+impl CloseEvent {
+    fn abnormal() -> Self {
+        Self {
+            code: 1006,
+            reason: String::new(),
+            was_clean: false,
+        }
+    }
+
+    fn from_peer(payload: &[u8], was_clean: bool) -> Result<Self, WebSocketError> {
+        let (code, reason) = match payload {
+            [] => (1005, ""),
+            [high, low, rest @ ..] if payload.len() <= 125 => {
+                let code = u16::from_be_bytes([*high, *low]);
+                // 1014 is the registered Bad Gateway close code.
+                if code != 1014 && !CloseCode::from(code).is_allowed() {
+                    return Err(WebSocketError::InvalidCloseCode);
+                }
+                let reason = std::str::from_utf8(rest).map_err(|_| WebSocketError::InvalidUTF8)?;
+                (code, reason)
+            }
+            _ => return Err(WebSocketError::InvalidCloseFrame),
+        };
+        Ok(Self {
+            code,
+            reason: reason.to_owned(),
+            was_clean,
+        })
+    }
+}
+
+type Writer = WebSocketWrite<tokio::io::WriteHalf<base_client::Stream>>;
+
+async fn send_frame(writer: &mut Writer, frame: Frame<'_>) -> Result<(), WebSocketError> {
+    writer.write_frame(frame).await?;
+    writer.flush().await
+}
+
+async fn close_session(
+    writer: &mut Writer,
+    frames: &mut (impl Stream<Item = Result<Frame<'static>, WebSocketError>> + Unpin),
+    timeout: Duration,
+) -> Result<CloseEvent, WebSocketError> {
+    let handshake = async {
+        send_frame(writer, Frame::close(1000, b"")).await?;
+        while let Some(frame) = frames.try_next().await? {
+            if frame.opcode == OpCode::Close {
+                return CloseEvent::from_peer(&frame.payload, true);
+            }
+        }
+        Err(WebSocketError::ConnectionClosed)
+    };
+    time::timeout(timeout, handshake)
+        .await
+        .unwrap_or_else(|_| Ok(CloseEvent::abnormal()))
 }
 
 async fn try_connect(
     url: &str,
     options: &ConnectionInitOptions,
     connect_timeout: Duration,
-) -> Result<base_client::Online, WebSocketClientError> {
+) -> Result<base_client::Socket, WebSocketClientError> {
     let mut offline = base_client::Offline::new();
     offline
         .set_writev(options.vectored)
         .set_writev_threshold(options.writev_threshold)
-        .set_auto_close(options.auto_close)
+        .set_auto_close(false)
+        .set_auto_pong(false)
         .set_max_message_size(options.max_message_size)
         .set_auto_apply_mask(options.auto_apply_mask)
         .set_proxy(options.proxy.clone());
+    offline.set_headers(options.custom_headers.clone());
 
-    for (k, v) in options.custom_headers.iter() {
-        offline.add_header(k.clone(), v.clone());
-    }
-
-    time::timeout(connect_timeout, offline.connect(url))
+    time::timeout(connect_timeout, offline.connect_socket(url))
         .await
         .map_err(|_| WebSocketClientError::ConnectionTimeout(connect_timeout))?
         .map_err(|e| WebSocketClientError::ConnectionError(e.to_string()))

@@ -1,30 +1,50 @@
+//! Direct access to a WebSocket connection. Use [`connect`] with the defaults,
+//! or configure an [`Offline`] client before connecting. Both return an [`Online`]
+//! connection whose reads and writes are driven by the caller.
+
+use crate::OpCode;
 use base64::Engine;
-use fastwebsockets::{Role, WebSocket, WebSocketError};
-use hyper_util::rt::TokioIo;
+use fastwebsockets::{FragmentCollector, Frame, WebSocket, WebSocketError, handshake};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha1::{Digest, Sha1};
 
-use crate::connection::{Reader, Writer};
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type Stream = TokioIo<hyper::upgrade::Upgraded>;
+pub(crate) type Socket = WebSocket<Stream>;
 
-/// Convenience helper: connect to `url` and return an [`Online`] client.
+/// Opens a WebSocket connection with default options.
 ///
-/// This is equivalent to:
-/// ```no_run
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-///     let mut offline = fast_websocket_client::base_client::Offline::new();
-///     let online = offline.connect("wss://echo.websocket.org").await?;
-///     let _ = online;
-///     Ok(())
-/// }
-/// ```
+/// Waits for the handshake and returns a connection ready for I/O.
+/// Use [`Offline::connect`] to supply custom request headers or connection settings.
 pub async fn connect(url: &str) -> Result<self::Online, Box<dyn std::error::Error + Send + Sync>> {
     self::Offline::new().connect(url).await
 }
 
-/// Builder-like struct holding connection options **before** the handshake.
+/// Configures a connection before the handshake. The same options can be reused
+/// to open another connection with [`Offline::connect`].
 ///
-/// Use [`Offline::new`] and its `set_*` / `add_header` methods, then call
-/// [`Offline::connect`] to obtain an [`Online`] WebSocket.
+/// ```no_run
+/// use fast_websocket_client::{OpCode, base_client::Offline};
+///
+/// #[tokio::main(flavor = "current_thread")]
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let mut options = Offline::new();
+///     options
+///         .add_header("Authorization", "Bearer mytoken")
+///         .set_max_message_size(1024 * 1024);
+///
+///     let mut socket = options.connect("wss://example.com/events").await?;
+///     loop {
+///         let frame = socket.receive_frame().await?;
+///         match frame.opcode {
+///             OpCode::Text => println!("{}", String::from_utf8_lossy(&frame.payload)),
+///             OpCode::Close => break,
+///             _ => {}
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
 pub struct Offline {
     vectored: bool,
     auto_close: bool,
@@ -59,16 +79,13 @@ impl Offline {
         }
     }
 
-    /// Adds a custom HTTP header to be included in the WebSocket handshake request.
+    /// Sets a handshake request header, replacing any previous value for that name.
+    /// Headers that the client generates, such as `Host` and `Sec-WebSocket-Key`,
+    /// are rejected by [`Self::connect`].
     ///
-    /// ```
-    /// use fast_websocket_client::base_client::Offline;
+    /// # Panics
     ///
-    /// let mut client = Offline::new();
-    /// client
-    ///     .add_header("Authorization", "Bearer mytoken")
-    ///     .add_header("X-Custom-Header", "custom-value");
-    /// ```
+    /// Panics if the name or value is invalid.
     pub fn add_header<K, V>(&mut self, key: K, value: V) -> &mut Self
     where
         K: std::convert::TryInto<hyper::header::HeaderName>,
@@ -82,90 +99,94 @@ impl Offline {
         self
     }
 
-    /// Sets whether to use vectored writes. This option does not guarantee that vectored writes will be always used.
-    ///
-    /// Default: `true`
+    #[cfg(feature = "callback_client")]
+    pub(crate) fn set_headers(&mut self, headers: crate::HeaderMap) {
+        self.custom_headers = headers;
+    }
+
+    /// Allows the frame header and payload to be written together in separate buffers.
+    /// Enabled by default. Configure the payload cutoff with [`Self::set_writev_threshold`].
     pub fn set_writev(&mut self, vectored: bool) -> &mut Self {
         self.vectored = vectored;
         self
     }
 
+    /// Sets the payload size above which vectored writes can be used. Defaults to 1024 bytes.
     pub fn set_writev_threshold(&mut self, threshold: usize) -> &mut Self {
         self.writev_threshold = threshold;
         self
     }
 
-    /// Sets whether to automatically close the connection when a close frame is received. When set to `false`, the application will have to manually send close frames.
-    ///
-    /// Default: `true`
+    /// Replies to a peer's Close frame while reading it. Enabled by default.
+    /// When disabled, the caller can reply with [`Online::send_close`].
     pub fn set_auto_close(&mut self, auto_close: bool) -> &mut Self {
         self.auto_close = auto_close;
         self
     }
 
-    /// Sets whether to automatically send a pong frame when a ping frame is received.
-    ///
-    /// Default: `true`
+    /// Answers incoming Pings with Pongs while reading. Enabled by default.
+    /// Disable this to receive Ping frames from [`Online::receive_frame`].
     pub fn set_auto_pong(&mut self, auto_pong: bool) -> &mut Self {
         self.auto_pong = auto_pong;
         self
     }
 
-    /// Sets the maximum complete message size in bytes, including all fragments.
-    /// A larger message returns an error; discard the connection after that error.
-    ///
-    /// Default: 64 MiB
+    /// Sets the maximum size in bytes of a text or binary message returned to the caller.
+    /// Defaults to 64 MiB.
     pub fn set_max_message_size(&mut self, max_message_size: usize) -> &mut Self {
         self.max_message_size = max_message_size;
         self
     }
 
-    /// Sets whether to automatically apply the mask to the frame payload.
-    ///
-    /// Default: `true`
+    /// Masks outgoing client frames as required by the WebSocket protocol.
+    /// Enabled by default.
     pub fn set_auto_apply_mask(&mut self, auto_apply_mask: bool) -> &mut Self {
         self.auto_apply_mask = auto_apply_mask;
         self
     }
 
     #[cfg(feature = "proxy")]
-    /// Sets a proxy to be used when establishing a connection.
-    ///
-    /// # Arguments
-    ///
-    /// * `proxy` - The proxy to be used.
+    /// Sets the proxy for this connection.
     pub fn set_proxy(&mut self, proxy: Option<crate::proxy::Proxy>) -> &mut Self {
         self.proxy = proxy;
         self
     }
 
-    /// Perform the TCP/TLS/WebSocket handshake with the stored options.
-    ///
-    /// * Respects the `proxy` feature and custom headers.  
-    /// * Applies `fastwebsockets` tuning parameters immediately after
-    ///   the handshake.
+    /// Opens a WebSocket connection with these options and waits for the handshake.
     ///
     /// # Errors
     ///
-    /// * URL parse / DNS / TCP / TLS failures  
-    /// * WebSocket handshake errors
+    /// Returns an error if the URL or headers are invalid, the transport fails
+    /// to connect, or the peer rejects the handshake.
     pub async fn connect(
         &mut self,
         url: &str,
     ) -> Result<Online, Box<dyn std::error::Error + Send + Sync>> {
-        self.connect_with_tls_connector(url, crate::tls_connector::get_tls_connector)
+        let socket = self.connect_socket(url).await?;
+        Ok(Online::new(socket, self.max_message_size))
+    }
+
+    pub(crate) async fn connect_socket(&self, url: &str) -> Result<Socket, BoxError> {
+        self.open_socket(url, crate::tls_connector::get_tls_connector)
             .await
     }
 
-    pub(crate) async fn connect_with_tls_connector<F>(
-        &mut self,
+    #[cfg(all(test, feature = "proxy", any(feature = "ring", feature = "aws_lc_rs")))]
+    pub(crate) async fn connect_with_tls_connector(
+        &self,
         url: &str,
-        tls_connector: F,
-    ) -> Result<Online, Box<dyn std::error::Error + Send + Sync>>
-    where
-        F: Fn() -> Result<tokio_rustls::TlsConnector, Box<dyn std::error::Error + Send + Sync>>
-            + Sync,
-    {
+        tls_connector: impl Fn() -> Result<tokio_rustls::TlsConnector, BoxError> + Sync,
+    ) -> Result<Online, BoxError> {
+        let socket = self.open_socket(url, tls_connector).await?;
+        Ok(Online::new(socket, self.max_message_size))
+    }
+
+    async fn open_socket(
+        &self,
+        url: &str,
+        tls_connector: impl Fn() -> Result<tokio_rustls::TlsConnector, BoxError> + Sync,
+    ) -> Result<Socket, BoxError> {
+        validate_headers(&self.custom_headers)?;
         let url = parse_url(url)?;
         let host = match url.host().unwrap() {
             url::Host::Domain(host) => host.to_owned(),
@@ -189,17 +210,6 @@ impl Offline {
             .header("Sec-WebSocket-Version", "13");
 
         for (key, value) in self.custom_headers.iter() {
-            if matches!(
-                key.as_str(),
-                "host"
-                    | "upgrade"
-                    | "connection"
-                    | "sec-websocket-key"
-                    | "sec-websocket-version"
-                    | "sec-websocket-extensions"
-            ) {
-                return Err(format!("reserved WebSocket handshake header: {key}").into());
-            }
             req_builder = req_builder.header(key, value);
         }
 
@@ -223,121 +233,109 @@ impl Offline {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid server name")
                 })?;
                 let tls_stream = tls_connector.connect(server_name, stream).await?;
-                handshake(request, tls_stream).await?
+                handshake::client(&TokioExecutor::new(), request, tls_stream).await?
             }
-            _ => handshake(request, stream).await?,
+            _ => handshake::client(&TokioExecutor::new(), request, stream).await?,
         };
 
-        let accept = response.headers().get_all("sec-websocket-accept");
-        if accept.iter().count() != 1
-            || accept
-                .iter()
-                .next()
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                != Some(expected_accept.as_str())
-        {
-            return Err("invalid Sec-WebSocket-Accept".into());
-        }
-        if response.headers().contains_key("sec-websocket-extensions") {
-            return Err("unsupported WebSocket extension".into());
-        }
-        let protocols = response.headers().get_all("sec-websocket-protocol");
-        if let Some(protocol) = protocols.iter().next() {
-            let selected = protocol.to_str()?;
-            let offered = self.custom_headers.get_all("sec-websocket-protocol");
-            if protocols.iter().count() != 1
-                || selected.is_empty()
-                || !offered
-                    .iter()
-                    .filter_map(|v| v.to_str().ok())
-                    .flat_map(|v| v.split(',').map(str::trim))
-                    .any(|v| v == selected)
-            {
-                return Err("unsolicited WebSocket subprotocol".into());
-            }
-        }
+        validate_response(response.headers(), &expected_accept, &self.custom_headers)?;
 
         ws.set_writev(self.vectored);
         ws.set_writev_threshold(self.writev_threshold);
-        ws.set_auto_close(false);
-        ws.set_auto_pong(false);
-        // The backend limit is exclusive and applies to individual frames.
-        // Control frames remain valid even with a smaller application limit.
+        ws.set_auto_close(self.auto_close);
+        ws.set_auto_pong(self.auto_pong);
+        // The frame limit is exclusive and must allow 125-byte control frames.
         ws.set_max_message_size(self.max_message_size.max(125).saturating_add(1));
         ws.set_auto_apply_mask(self.auto_apply_mask);
-
-        let (reader, writer) = ws.split(tokio::io::split);
-        Ok(Online {
-            reader: Reader::new(reader, self.max_message_size),
-            writer: Writer::new(writer, self.auto_close, self.auto_pong),
-        })
+        Ok(ws)
     }
 }
 
-async fn handshake<S>(
-    request: hyper::Request<http_body_util::Empty<hyper::body::Bytes>>,
-    stream: S,
-) -> Result<
-    (
-        WebSocket<TokioIo<hyper::upgrade::Upgraded>>,
-        hyper::Response<hyper::body::Incoming>,
-    ),
-    WebSocketError,
->
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    let (mut sender, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
-    tokio::spawn(async move {
-        let _ = connection.with_upgrades().await;
-    });
-    let mut response = sender.send_request(request).await?;
-    if response.status() != hyper::StatusCode::SWITCHING_PROTOCOLS {
-        return Err(WebSocketError::InvalidStatusCode(
-            response.status().as_u16(),
-        ));
+fn validate_response(
+    headers: &crate::HeaderMap,
+    expected_accept: &str,
+    request_headers: &crate::HeaderMap,
+) -> Result<(), BoxError> {
+    if headers.get_all(hyper::header::UPGRADE).iter().count() != 1 {
+        return Err(WebSocketError::InvalidUpgradeHeader.into());
     }
-    if !response
-        .headers()
-        .get(hyper::header::UPGRADE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-    {
-        return Err(WebSocketError::InvalidUpgradeHeader);
-    }
-
-    let mut upgrade = false;
-    for value in response.headers().get_all(hyper::header::CONNECTION) {
-        let value = value
+    for value in headers.get_all(hyper::header::CONNECTION) {
+        if !value
             .to_str()
-            .map_err(|_| WebSocketError::InvalidConnectionHeader)?;
-        for token in value
+            .map_err(|_| WebSocketError::InvalidConnectionHeader)?
             .split(',')
-            .map(|token| token.trim_matches([' ', '\t']))
+            .map(str::trim)
+            .all(|token| token.is_empty() || is_token(token))
         {
-            if token.is_empty() {
-                continue;
-            }
-            if !token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-            {
-                return Err(WebSocketError::InvalidConnectionHeader);
-            }
-            upgrade |= token.eq_ignore_ascii_case("upgrade");
+            return Err(WebSocketError::InvalidConnectionHeader.into());
         }
     }
-    if !upgrade {
-        return Err(WebSocketError::InvalidConnectionHeader);
+    let mut accept = headers.get_all("sec-websocket-accept").iter();
+    if accept.next().and_then(|v| v.to_str().ok()) != Some(expected_accept)
+        || accept.next().is_some()
+    {
+        return Err("invalid Sec-WebSocket-Accept".into());
     }
+    if headers.contains_key("sec-websocket-extensions") {
+        return Err("unsupported WebSocket extension".into());
+    }
+    let mut selected = headers.get_all("sec-websocket-protocol").iter();
+    if let Some(protocol) = selected.next() {
+        let protocol = protocol.to_str()?;
+        let offered = request_headers.get_all("sec-websocket-protocol");
+        if selected.next().is_some()
+            || !offered
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(',').map(str::trim))
+                .any(|token| token == protocol)
+        {
+            return Err("unsolicited WebSocket subprotocol".into());
+        }
+    }
+    Ok(())
+}
 
-    let upgraded = hyper::upgrade::on(&mut response).await?;
-    Ok((
-        WebSocket::after_handshake(TokioIo::new(upgraded), Role::Client),
-        response,
-    ))
+// HTTP field names and WebSocket subprotocols share the HTTP token grammar.
+fn is_token(token: &str) -> bool {
+    hyper::header::HeaderName::from_bytes(token.as_bytes()).is_ok()
+}
+
+pub(crate) fn validate_headers(headers: &crate::HeaderMap) -> Result<(), BoxError> {
+    for name in headers.keys() {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "upgrade"
+                | "connection"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-extensions"
+        ) {
+            return Err(format!("reserved WebSocket handshake header: {name}").into());
+        }
+    }
+    let mut protocols = std::collections::HashSet::new();
+    for value in headers.get_all("sec-websocket-protocol") {
+        for protocol in value.to_str()?.split(',').map(str::trim) {
+            if !is_token(protocol) || !protocols.insert(protocol) {
+                return Err("expected unique WebSocket subprotocol tokens".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn check_message_size(frame: &Frame<'_>, limit: usize) -> Result<(), WebSocketError> {
+    match frame.opcode {
+        OpCode::Text | OpCode::Binary if frame.payload.len() > limit => {
+            Err(WebSocketError::FrameTooLarge)
+        }
+        OpCode::Close | OpCode::Ping | OpCode::Pong if frame.payload.len() > 125 => {
+            Err(WebSocketError::InvalidValue)
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn parse_url(url: &str) -> Result<url::Url, Box<dyn std::error::Error + Send + Sync>> {
@@ -346,56 +344,55 @@ pub(crate) fn parse_url(url: &str) -> Result<url::Url, Box<dyn std::error::Error
         || url.host().is_none()
         || url.fragment().is_some()
     {
-        return Err("expected a ws/wss URL with a host and no fragment".into());
+        return Err("expected a ws/wss or http/https URL with a host and no fragment".into());
     }
     Ok(url)
 }
 
-/// Provides receive/send functions for an established connection.
-///
-/// If a send or receive future is cancelled, discard the connection. Restarting
-/// I/O after cancellation can leave a partially consumed or written frame.
+/// An established WebSocket connection for sending messages and receiving frames.
+/// [`Self::receive_frame`] returns complete text and binary messages, including
+/// messages the peer split across multiple frames. To reconnect, call [`Offline::connect`] again.
 pub struct Online {
-    pub(crate) reader: Reader,
-    pub(crate) writer: Writer,
+    socket: FragmentCollector<Stream>,
+    max_message_size: usize,
 }
 
 impl Online {
-    /// Receive the next WebSocket frame from the server.
-    ///
-    /// Fragmented messages are assembled within the configured size limit,
-    /// and text payloads are validated as UTF-8.
-    ///
-    /// # Cancellation
-    /// If this future is cancelled, discard the connection; do not restart a
-    /// receive on it. The high-level client preserves its pending read instead.
-    #[inline]
-    pub async fn receive_frame(
-        &mut self,
-    ) -> Result<fastwebsockets::Frame<'_>, Box<dyn std::error::Error + Send + Sync>> {
-        loop {
-            let frame = self.reader.read().await?;
-            if frame.opcode == crate::OpCode::Ping && self.writer.auto_pong {
-                self.writer.respond(&frame).await?;
-                continue;
-            }
-            if self.writer.is_closed() && frame.opcode != crate::OpCode::Close {
-                return Err(fastwebsockets::WebSocketError::ConnectionClosed.into());
-            }
-            self.writer.respond(&frame).await?;
-            return Ok(frame);
+    fn new(socket: Socket, max_message_size: usize) -> Self {
+        Self {
+            socket: FragmentCollector::new(socket),
+            max_message_size,
         }
     }
 
+    /// Receives the next complete message or control frame.
+    ///
+    /// By default, this read answers incoming Pings and continues waiting. A peer's
+    /// Close is acknowledged and returned to the caller.
+    ///
+    /// For periodic idle notifications, pin the receive future once and pass
+    /// `&mut receive` to each `tokio::time::timeout`. The pending read may
+    /// already have consumed part of a frame.
     #[inline]
-    async fn _send_frame(
+    pub async fn receive_frame(
         &mut self,
-        frame: fastwebsockets::Frame<'_>,
-    ) -> Result<(), fastwebsockets::WebSocketError> {
-        self.writer.write(frame).await
+    ) -> Result<Frame<'_>, Box<dyn std::error::Error + Send + Sync>> {
+        let frame = self.socket.read_frame().await?;
+        check_message_size(&frame, self.max_message_size)?;
+        Ok(frame)
     }
 
-    /// Sends a ping frame to the stream.
+    #[inline]
+    async fn _send_frame(&mut self, frame: Frame<'_>) -> Result<(), WebSocketError> {
+        if matches!(frame.opcode, OpCode::Close | OpCode::Ping | OpCode::Pong)
+            && frame.payload.len() > 125
+        {
+            return Err(WebSocketError::InvalidValue);
+        }
+        self.socket.write_frame(frame).await
+    }
+
+    /// Sends a Ping with a UTF-8 payload of up to 125 bytes.
     #[inline]
     pub async fn send_ping(
         &mut self,
@@ -403,7 +400,7 @@ impl Online {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self._send_frame(fastwebsockets::Frame::new(
             true,
-            crate::OpCode::Ping,
+            OpCode::Ping,
             None,
             data.as_bytes().into(),
         ))
@@ -411,7 +408,7 @@ impl Online {
         Ok(())
     }
 
-    /// Sends a pong frame to the stream.
+    /// Sends a Pong with a UTF-8 payload of up to 125 bytes.
     #[inline]
     pub async fn send_pong(
         &mut self,
@@ -422,10 +419,7 @@ impl Online {
         Ok(())
     }
 
-    /// Send a UTF-8 text frame.
-    ///
-    /// # Errors
-    /// Propagates underlying I/O or protocol errors from `fastwebsockets`.
+    /// Sends a UTF-8 text frame.
     #[inline]
     pub async fn send_string(
         &mut self,
@@ -436,7 +430,7 @@ impl Online {
         Ok(())
     }
 
-    /// Serialize `data` to JSON and send as a text frame.
+    /// Serializes `data` to JSON and sends it as a text frame.
     #[inline]
     pub async fn send_json(
         &mut self,
@@ -448,8 +442,7 @@ impl Online {
         Ok(())
     }
 
-    /// Send binary payload as an **unmasked** binary frame (masking is
-    /// handled automatically when `auto_apply_mask` is true).
+    /// Sends a binary frame.
     #[inline]
     pub async fn send_binary(
         &mut self,
@@ -460,9 +453,9 @@ impl Online {
         Ok(())
     }
 
-    /// Transmit a WebSocket Close frame with [`fastwebsockets::CloseCode::Normal`].
-    ///
-    /// Pass an empty string to omit the reason.
+    /// Sends a normal Close frame (code 1000) with a reason of up to 123 UTF-8 bytes.
+    /// Pass an empty string to omit the reason. To wait for the peer's Close,
+    /// continue reading with [`Self::receive_frame`].
     pub async fn send_close(
         &mut self,
         data: &str,

@@ -1,19 +1,18 @@
-use fast_websocket_client::{ClientConfig, WebSocketBuilder};
-use tokio::sync::mpsc;
-use tokio::time::{Duration, sleep};
+//! Register standalone handlers with the builder and pass echoed numbers back to `main`.
+//! Run with `cargo run --example builders_channels_handler_functions`.
 
-/// Called when the WebSocket opens
+use fast_websocket_client::WebSocketBuilder;
+use tokio::sync::mpsc;
+
 async fn handle_open(open_tx: mpsc::Sender<()>) {
     println!("[OPEN] WebSocket connection established.");
     let _ = open_tx.send(()).await;
 }
 
-/// Called when the WebSocket closes
 async fn handle_close() {
     println!("[CLOSE] WebSocket connection closed.");
 }
 
-/// Called for each incoming message
 async fn handle_message(msg_tx: mpsc::Sender<u32>, msg: String) {
     println!("[MESSAGE] {}", msg);
     if let Some(n) = msg.strip_prefix('#').and_then(|s| s.parse().ok()) {
@@ -23,28 +22,22 @@ async fn handle_message(msg_tx: mpsc::Sender<u32>, msg: String) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
-    // channel for open notification
     let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
-    // channel for parsed message numbers
     let (msg_tx, mut msg_rx) = mpsc::channel::<u32>(1);
 
-    // Register callbacks before starting the first background connection attempt.
     let ws = WebSocketBuilder::new()
         .on_open(move |_| handle_open(open_tx.clone()))
         .on_close(|_| handle_close())
         .on_message(move |msg| handle_message(msg_tx.clone(), msg))
-        .connect_with_config(
-            "wss://echo.websocket.org",
-            ClientConfig::new().with_close_timeout(Duration::from_secs(3)),
-        )
+        .connect("wss://echo.websocket.org")
         .await?;
 
-    // wait for the connection to open
     let _ = open_rx.recv().await;
-    // send the first message
+    // Only the first open starts the exchange. Later callbacks can finish immediately.
+    open_rx.close();
     ws.send("#1").await?;
 
-    // loop until we reach #10
+    // Each echo triggers the next number, up to #10.
     while let Some(n) = msg_rx.recv().await {
         if n >= 10 {
             break;
@@ -53,8 +46,6 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
         ws.send(&next).await?;
     }
 
-    // wait a bit and then close
-    sleep(Duration::from_secs(2)).await;
     ws.close().await;
     ws.await_shutdown().await?;
     Ok(())

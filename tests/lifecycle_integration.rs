@@ -2,26 +2,15 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use fast_websocket_client::{ClientConfig, WebSocketBuilder, WebSocketClientError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::{Instant, sleep, timeout};
 
 const DEADLINE: Duration = Duration::from_secs(3);
-
-async fn read_data_or_close(peer: &mut TcpStream) -> (u8, Vec<u8>) {
-    loop {
-        let (opcode, payload) = common::read_frame(peer).await.unwrap();
-        if opcode == 9 {
-            common::write_frame(peer, true, 10, &payload).await;
-        } else {
-            return (opcode, payload);
-        }
-    }
-}
 
 #[tokio::test]
 async fn local_close_waits_for_peer_acknowledgment_and_emits_one_close() {
@@ -49,38 +38,86 @@ async fn local_close_waits_for_peer_acknowledgment_and_emits_one_close() {
                     let _ = tx.send(error);
                 }
             })
-            .connect_with_config(
-                &url,
-                ClientConfig::new().with_close_timeout(Duration::from_secs(1)),
-            )
+            .connect_with_config(&url, ClientConfig::new().with_close_timeout(Duration::MAX))
             .await
             .unwrap();
         let mut peer = common::accept_ws(&listener).await;
         open_rx.recv().await.unwrap();
+        socket.send("before close").await.unwrap();
+        socket.send_binary(&[1, 2]).await.unwrap();
         socket.close().await;
-        let (opcode, close_payload) = read_data_or_close(&mut peer).await;
+        assert!(socket.send("after close").await.is_err());
+        assert!(socket.send_binary(&[3]).await.is_err());
+        assert_eq!(
+            common::read_data_or_close(&mut peer).await,
+            (1, b"before close".to_vec())
+        );
+        assert_eq!(common::read_data_or_close(&mut peer).await, (2, vec![1, 2]));
+        let (opcode, close_payload) = common::read_data_or_close(&mut peer).await;
         assert_eq!((opcode, close_payload.as_slice()), (8, [3, 232].as_slice()));
 
-        let shutdown = socket.await_shutdown();
-        tokio::pin!(shutdown);
-        assert!(
-            timeout(Duration::from_millis(25), &mut shutdown)
-                .await
-                .is_err(),
-            "local Close must retain the connection while awaiting its acknowledgment"
-        );
         assert!(matches!(
             close_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        common::write_frame(&mut peer, true, 8, &close_payload).await;
-        shutdown.await.unwrap();
+        common::write_frame(&mut peer, true, 8, b"\x03\xe8received").await;
+        socket.await_shutdown().await.unwrap();
         let event = close_rx.recv().await.unwrap();
         assert_eq!(event.code, 1000);
-        assert!(event.reason.is_empty());
+        assert_eq!(event.reason, "received");
         assert!(event.was_clean);
         assert_eq!(close_rx.recv().await, None);
         assert!(error_rx.try_recv().is_err());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incoming_callbacks_finish_in_wire_order_even_when_one_awaits() {
+    timeout(DEADLINE, async {
+        let (listener, url) = common::listener().await;
+        let release = Arc::new(Notify::new());
+        let wait = release.clone();
+        let (text, mut events) = mpsc::unbounded_channel();
+        let binary = text.clone();
+        let close = text.clone();
+        let socket = WebSocketBuilder::new()
+            .on_message(move |_| {
+                let (text, wait) = (text.clone(), wait.clone());
+                async move {
+                    text.send("text started").unwrap();
+                    wait.notified().await;
+                    text.send("text finished").unwrap();
+                }
+            })
+            .on_binary(move |_| {
+                let binary = binary.clone();
+                async move { binary.send("binary").unwrap() }
+            })
+            .on_close(move |_| {
+                let close = close.clone();
+                async move { close.send("close").unwrap() }
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        let mut peer = common::accept_ws(&listener).await;
+        common::write_frame(&mut peer, true, 1, b"first").await;
+        assert_eq!(events.recv().await, Some("text started"));
+        common::write_frame(&mut peer, true, 2, &[1]).await;
+        common::write_frame(&mut peer, true, 8, &1000u16.to_be_bytes()).await;
+        assert!(
+            timeout(Duration::from_millis(25), events.recv())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        for event in ["text finished", "binary", "close"] {
+            assert_eq!(events.recv().await, Some(event));
+        }
+        socket.close().await;
+        socket.await_shutdown().await.unwrap();
     })
     .await
     .unwrap();
@@ -105,27 +142,20 @@ async fn dropping_connected_handle_closes_once_without_reconnecting() {
                     let _ = tx.send(());
                 }
             })
-            .connect_with_config(
-                &url,
-                ClientConfig::new().with_reconnect_delay(Duration::ZERO),
-            )
+            .connect(&url)
             .await
             .unwrap();
         let mut peer = common::accept_ws(&listener).await;
         open_rx.recv().await.unwrap();
         drop(socket);
-        let (opcode, close_payload) = read_data_or_close(&mut peer).await;
+        let (opcode, close_payload) = common::read_data_or_close(&mut peer).await;
         assert_eq!(opcode, 8);
         common::write_frame(&mut peer, true, 8, &close_payload).await;
         assert_eq!(close_rx.recv().await, Some(()));
         // Callback senders disappear only when the detached driver terminates.
         assert_eq!(close_rx.recv().await, None);
         assert_eq!(open_rx.recv().await, None);
-        assert!(
-            timeout(Duration::from_millis(25), listener.accept())
-                .await
-                .is_err()
-        );
+        common::assert_no_pending_connection(listener);
     })
     .await
     .unwrap();
@@ -158,7 +188,7 @@ async fn local_close_times_out_when_peer_never_acknowledges() {
         open_rx.recv().await.unwrap();
         let requested_at = Instant::now();
         socket.close().await;
-        assert_eq!(read_data_or_close(&mut peer).await.0, 8);
+        assert_eq!(common::read_data_or_close(&mut peer).await.0, 8);
         socket.await_shutdown().await.unwrap();
         assert!(
             requested_at.elapsed() >= close_timeout,
@@ -291,11 +321,11 @@ async fn zero_ping_update_reports_error_and_keeps_the_connection_usable() {
         assert!(error_rx.recv().await.unwrap().contains("ping_interval"));
         socket.send("still connected").await.unwrap();
         assert_eq!(
-            read_data_or_close(&mut peer).await,
+            common::read_data_or_close(&mut peer).await,
             (1, b"still connected".to_vec())
         );
         socket.close().await;
-        let (opcode, close_payload) = read_data_or_close(&mut peer).await;
+        let (opcode, close_payload) = common::read_data_or_close(&mut peer).await;
         assert_eq!(opcode, 8);
         common::write_frame(&mut peer, true, 8, &close_payload).await;
         socket.await_shutdown().await.unwrap();
