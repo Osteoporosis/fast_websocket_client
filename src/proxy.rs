@@ -1,3 +1,7 @@
+//! Connect through an HTTP CONNECT or SOCKS5 proxy. Pass the [`Proxy`] to
+//! [`Offline::set_proxy`](crate::base_client::Offline::set_proxy) for the low-level
+//! API, or to `ConnectionInitOptions::proxy` for the callback client.
+
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -11,16 +15,19 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use tokio_socks::tcp::Socks5Stream;
 use url::Url;
 
-/// Builder pattern for constructing a [`Proxy`] instance.
+/// Builds an HTTP CONNECT or SOCKS5 proxy.
 ///
-/// Example:
 /// ```
+/// use fast_websocket_client::base_client::Offline;
 /// use fast_websocket_client::proxy::ProxyBuilder;
 ///
 /// let proxy = ProxyBuilder::new()
-///     .http("http://proxy.example.com:8080").unwrap()
+///     .http("https://proxy.example.com:8443")?
 ///     .auth("user", "pass")
-///     .build().unwrap();
+///     .build()?;
+/// let mut client = Offline::new();
+/// client.set_proxy(Some(proxy));
+/// # Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
 /// ```
 #[derive(Debug, Default)]
 pub struct ProxyBuilder {
@@ -68,10 +75,7 @@ impl ProxyBuilder {
         self
     }
 
-    /// Consume the builder and return a concrete [`Proxy`].
-    ///
-    /// # Errors
-    /// * Returns an error if neither `http` nor `socks5` was specified.
+    /// Returns the configured proxy. Requires either HTTP or SOCKS5.
     pub fn build(self) -> Result<Proxy, Box<dyn Error + Send + Sync>> {
         match self.kind {
             Some(ProxyKind::Http(uri)) => Ok(Proxy::Http {
@@ -112,15 +116,6 @@ pub enum Proxy {
 }
 
 impl Proxy {
-    /// Open a stream through the proxy to `target_host:target_port`.
-    ///
-    /// Returns a connected stream ready for the destination's TLS/WebSocket handshake.
-    ///
-    /// # Errors
-    ///
-    /// * Underlying network I/O errors  
-    /// * Authentication failures  
-    /// * Unsupported proxy scheme, invalid/oversized response, or non-2xx status
     pub(crate) async fn tunnel(
         &self,
         target_host: &str,
@@ -245,7 +240,6 @@ async fn read_connect_response(
     }
 }
 
-// Keep ordinary TCP paths unboxed; retain the outer TLS session throughout the tunnel.
 pub(crate) enum ProxyStream {
     Plain(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),

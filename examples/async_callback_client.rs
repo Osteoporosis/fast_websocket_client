@@ -1,20 +1,18 @@
-// try this example with
-// `cargo run --example wss_client`
+//! Run with `cargo run --example wss_client`. A browser equivalent follows the Rust example.
 
 use fast_websocket_client::WebSocket;
 use tokio::time::{Duration, sleep};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
-    // Starts connecting in the background; results arrive through callbacks.
     let ws = WebSocket::new("wss://echo.websocket.org").await?;
 
     ws.on_open(|_| async move {
         println!("[OPEN] WebSocket connection opened.");
     })
     .await;
-    ws.on_close(|_| async move {
-        println!("[CLOSE] WebSocket connection closed.");
+    ws.on_close(|event| async move {
+        println!("[CLOSE] {} {}", event.code, event.reason);
     })
     .await;
     ws.on_message(|message| async move {
@@ -30,7 +28,6 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
     })
     .await;
 
-    sleep(Duration::from_secs(2)).await;
     ws.send_binary(&[0, 1, 255]).await?;
     for i in 1..5 {
         let message = format!("#{}", i);
@@ -60,15 +57,12 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
       return new Promise(resolve => setTimeout(resolve, ms));
     }
 
-    async function main() {
+    function main() {
       const ws = new WebSocket("wss://echo.websocket.org");
       ws.binaryType = "arraybuffer";
 
-      ws.onopen = () => {
-        console.log("[OPEN] WebSocket connection opened.");
-      };
-      ws.onclose = () => {
-        console.log("[CLOSE] WebSocket connection closed.");
+      ws.onclose = (event) => {
+        console.log("[CLOSE]", event.code, event.reason);
       };
       ws.onmessage = (event) => {
         if (typeof event.data === "string") {
@@ -81,21 +75,23 @@ async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
         console.error("[ERROR]", event);
       };
 
-      await sleep(2000);
-      ws.send(new Uint8Array([0, 1, 255]));
-      for (let i = 1; i < 5; i++) {
-        const message = `#${i}`;
-        try {
-          ws.send(message);
-          console.log("[SEND]", message);
-        } catch (err) {
-          console.error("[ERROR] Send error:", err);
-          break;
+      ws.onopen = async () => {
+        console.log("[OPEN] WebSocket connection opened.");
+        ws.send(new Uint8Array([0, 1, 255]));
+        for (let i = 1; i < 5; i++) {
+          const message = `#${i}`;
+          try {
+            ws.send(message);
+            console.log("[SEND]", message);
+          } catch (err) {
+            console.error("[ERROR] Send error:", err);
+            break;
+          }
+          await sleep(2000);
         }
-        await sleep(2000);
-      }
 
-      ws.close();
+        ws.close();
+      };
     }
 
     main();

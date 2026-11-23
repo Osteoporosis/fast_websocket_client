@@ -9,6 +9,14 @@ pub async fn listener() -> (TcpListener, String) {
     (listener, url)
 }
 
+pub fn assert_no_pending_connection(listener: TcpListener) {
+    let listener = listener.into_std().unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 pub async fn read_headers<S: AsyncRead + Unpin>(stream: &mut S) -> String {
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
@@ -18,8 +26,7 @@ pub async fn read_headers<S: AsyncRead + Unpin>(stream: &mut S) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> String {
-    let headers = read_headers(stream).await;
+pub fn handshake_response(headers: &str) -> String {
     let key = headers
         .lines()
         .find_map(|line| {
@@ -35,10 +42,17 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> Str
         .unwrap();
     let (response, _) = fastwebsockets::upgrade::upgrade(&mut request).unwrap();
     let accept = response.headers()["Sec-WebSocket-Accept"].to_str().unwrap();
-    let response = format!(
+    format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-    );
-    stream.write_all(response.as_bytes()).await.unwrap();
+    )
+}
+
+pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> String {
+    let headers = read_headers(stream).await;
+    stream
+        .write_all(handshake_response(&headers).as_bytes())
+        .await
+        .unwrap();
     headers
 }
 
@@ -92,6 +106,17 @@ pub async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result
         }
     }
     Ok((first & 15, payload))
+}
+
+pub async fn read_data_or_close(peer: &mut TcpStream) -> (u8, Vec<u8>) {
+    loop {
+        let (opcode, payload) = read_frame(peer).await.unwrap();
+        if opcode == 9 {
+            write_frame(peer, true, 10, &payload).await;
+        } else {
+            return (opcode, payload);
+        }
+    }
 }
 
 pub async fn reply_until_close<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {

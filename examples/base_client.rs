@@ -1,6 +1,10 @@
+//! Subscribe to Binance book tickers using the low-level client.
+//! Run with `cargo run --example base_client`.
+
 use std::time::{Duration, Instant};
 
 use fast_websocket_client::{OpCode, base_client};
+use tokio::time::timeout;
 
 #[derive(serde::Serialize)]
 struct Subscription {
@@ -18,8 +22,7 @@ async fn subscribe(
         params: vec!["btcusdt@bookTicker".to_string()],
         id: started_at.elapsed().as_nanos(),
     };
-    client.send_json(&data).await?;
-    Ok(())
+    client.send_json(&data).await
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,23 +32,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .unwrap();
 
-    // the lowest volume example
     let url = "wss://data-stream.binance.vision:9443/ws/bakeusdt@bookTicker";
 
     let handle = runtime.spawn(async move {
         'reconnect_loop: loop {
-            let future = base_client::connect(url);
-            /*
-                alternative code for an example:
-                    1. make an Offline client
-                    2. apply an intentional error raising setting before `connect`
-                    3. call `connect` to get a future
-            */
-            // let mut client = base_client::Offline::new();
-            // client.set_max_message_size(64);
-            // let future = client.connect(url);
-
-            let mut client: base_client::Online = match future.await {
+            // To try a custom receive limit, replace the connect call below with
+            // `base_client::Offline::new().set_max_message_size(64).connect(url).await`.
+            let mut client = match base_client::connect(url).await {
                 Ok(client) => {
                     println!("connected");
                     client
@@ -57,30 +50,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            // add one more example subscription here after connect
+            // The URL selects one ticker. Subscribe to a second ticker on each new connection.
             if let Err(e) = subscribe(&mut client, started_at).await {
                 eprintln!("Reconnecting from an Error: {e:?}");
-                let _ = client.send_close("").await;
+                drop(client);
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             };
 
-            // message processing loop
             loop {
-                let message = if let Ok(result) =
-                    tokio::time::timeout(Duration::from_millis(100), client.receive_frame()).await
-                {
-                    match result {
-                        Ok(message) => message,
-                        Err(e) => {
-                            eprintln!("Reconnecting from an Error: {e:?}");
-                            let _ = client.send_close("").await;
-                            break; // break the message loop then reconnect
+                let result = {
+                    // Report quiet intervals while allowing a partially read frame to finish.
+                    let mut receive = std::pin::pin!(client.receive_frame());
+                    loop {
+                        match timeout(Duration::from_millis(100), &mut receive).await {
+                            Ok(result) => break result,
+                            Err(_) => println!("timeout"),
                         }
                     }
-                } else {
-                    println!("receive timed out; discarding the connection");
-                    break;
+                };
+                let message = match result {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        eprintln!("Reconnecting from an Error: {e:?}");
+                        break;
+                    }
                 };
 
                 match message.opcode {
@@ -90,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Err(e) => {
                                 eprintln!("Reconnecting from an Error: {e:?}");
                                 let _ = client.send_close("").await;
-                                break; // break the message loop then reconnect
+                                break;
                             }
                         };
                         println!("{payload}");

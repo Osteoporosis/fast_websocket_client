@@ -44,12 +44,14 @@ async fn receive_peer_close(payload: &[u8]) -> CloseEvent {
 async fn peer_close_reports_code_and_utf8_reason() {
     timeout(DEADLINE, async {
         let reason = "maintenance ☕";
-        let mut payload = 4001_u16.to_be_bytes().to_vec();
-        payload.extend_from_slice(reason.as_bytes());
-        let event = receive_peer_close(&payload).await;
-        assert_eq!(event.code, 4001);
-        assert_eq!(event.reason, reason);
-        assert!(event.was_clean);
+        for code in [1014u16, 4001] {
+            let mut payload = code.to_be_bytes().to_vec();
+            payload.extend_from_slice(reason.as_bytes());
+            let event = receive_peer_close(&payload).await;
+            assert_eq!(event.code, code);
+            assert_eq!(event.reason, reason);
+            assert!(event.was_clean);
+        }
     })
     .await
     .unwrap();
@@ -87,14 +89,10 @@ async fn runtime_close_callback_reports_an_unanswered_peer_close() {
             })
             .await;
         socket.send("ready").await.unwrap();
-        loop {
-            let frame = common::read_frame(&mut peer).await.unwrap();
-            if frame.0 == 1 {
-                assert_eq!(frame.1, b"ready");
-                break;
-            }
-            assert_eq!(frame.0, 9);
-        }
+        assert_eq!(
+            common::read_data_or_close(&mut peer).await,
+            (1, b"ready".to_vec())
+        );
 
         let reason = "server restarting";
         let mut payload = 1012_u16.to_be_bytes().to_vec();

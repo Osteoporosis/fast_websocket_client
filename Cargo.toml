@@ -1,6 +1,6 @@
 [package]
 name = "fast_websocket_client"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 categories = [
     "asynchronous",
@@ -15,8 +15,6 @@ authors = ["Hyoungjun Son"]
 description = "Tokio-native WebSocket client for Rust. High-throughput, low-latency, callback-driven, proxy-ready."
 repository = "https://github.com/Osteoporosis/fast_websocket_client/"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [[example]]
 name = "wss_client"
 path = "examples/async_callback_client.rs"
@@ -28,8 +26,9 @@ path = "examples/builders_channels_handler_functions.rs"
 required-features = ["callback_client"]
 
 [dependencies]
-base64 = "0.23.1"
-fastwebsockets = { version = "0.10.0", features = ["simd", "upgrade", "unstable-split"] }
+base64 = "0.21.7"
+fastwebsockets = { version = "0.10.0", features = ["simd", "upgrade"] }
+futures-util = { version = "0.3.34", default-features = false, optional = true }
 http-body-util = "0.1.5"
 httparse = { version = "1.10.1", optional = true }
 hyper = "1.12.0"
@@ -37,8 +36,7 @@ hyper-util = "0.1.21"
 rustls-pki-types = "1.16.0"
 serde = "1.0.229"
 serde_json = "1.0.154"
-sha1 = "0.11.0"
-simdutf8 = { version = "0.1.5", features = ["aarch64_neon"] }
+sha1 = "0.10.7"
 thiserror = { version = "2.0.21", optional = true }
 tokio = { version = "1.54.1", default-features = false, features = [
     "net",
@@ -55,15 +53,15 @@ webpki-roots = "1.0.12"
 
 [features]
 default = ["callback_client", "proxy", "aws_lc_rs"]
-# Kept for callers that enabled the formerly optional dependency directly.
+# Compatibility feature for existing manifests.
 base64 = []
 aws_lc_rs = ["tokio-rustls/aws_lc_rs"]
 ring = ["tokio-rustls/ring"]
-callback_client = ["proxy", "thiserror", "tokio/macros"]
+callback_client = ["proxy", "thiserror", "dep:futures-util", "fastwebsockets/unstable-split", "tokio/macros", "tokio/sync", "tokio/time"]
 proxy = ["httparse", "tokio-socks"]
 
 [dev-dependencies]
-futures = "0.3.34"
+simdutf8 = { version = "0.1.5", features = ["aarch64_neon"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", default-features = false, features = [
     "macros",

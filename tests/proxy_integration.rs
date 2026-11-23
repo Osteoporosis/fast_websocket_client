@@ -170,11 +170,7 @@ async fn http_proxy_url_credentials_are_rejected_before_network_io() {
             );
         }
     }
-    assert!(
-        timeout(Duration::from_millis(25), listener.accept())
-            .await
-            .is_err()
-    );
+    common::assert_no_pending_connection(listener);
 }
 
 #[tokio::test]
@@ -227,11 +223,7 @@ async fn https_proxy_is_accepted_and_unsupported_schemes_are_rejected_before_net
         error.to_string().contains("unsupported proxy scheme"),
         "{error}"
     );
-    assert!(
-        timeout(Duration::from_millis(25), listener.accept())
-            .await
-            .is_err()
-    );
+    common::assert_no_pending_connection(listener);
 }
 
 #[tokio::test]

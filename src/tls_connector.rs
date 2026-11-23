@@ -2,11 +2,6 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio_rustls::rustls::{self, crypto::CryptoProvider};
 
-/// Returns a pre-configured [`tokio_rustls::TlsConnector`] with
-/// *webpki* root certificates preloaded.
-///
-/// Honors the application's installed crypto provider. Without one, exactly
-/// one of this crate's `aws_lc_rs` or `ring` features must be enabled.
 pub(crate) fn get_tls_connector() -> Result<tokio_rustls::TlsConnector, Box<dyn Error + Send + Sync>>
 {
     let provider = CryptoProvider::get_default().cloned().or_else(default_provider)

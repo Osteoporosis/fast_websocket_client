@@ -3,145 +3,81 @@
 [![Crates.io](https://img.shields.io/crates/v/fast_websocket_client)](https://crates.io/crates/fast_websocket_client)
 [![docs.rs](https://docs.rs/fast_websocket_client/badge.svg)](https://docs.rs/fast_websocket_client)
 
-**Tokio-native WebSocket client for Rust** – high-throughput, low-latency, callback-driven, proxy-ready.
+An ergonomic, JavaScript-like WebSocket client for Tokio.
 
-Supports two modes of operation:
-
-- **High-level callback-based client** for ergonomic event-driven use.
-- **Low-level direct API** for fine-tuned control with minimal dependencies.
-
-Quick Example: [examples/async_callback_client.rs](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/async_callback_client.rs)
-
-## Features
-
-- JavaScript-like callback API for event handling
-- Separate text (`String`) and binary (`Vec<u8>`) message callbacks
-- Async/await support via `tokio`
-- Powered by [`fastwebsockets`](https://github.com/denoland/fastwebsockets)
-- Built-in reconnection and ping loop
-- TLS support
-- Custom HTTP headers for handshake (e.g., Authorization)
-- Proxy support (HTTP/HTTPS CONNECT & SOCKS5)
+- **Callback API** — async event handlers, automatic reconnection, and heartbeat pings.
+- **Low-level API** — direct control over reads and writes.
+- **Both APIs** support TLS, custom handshake headers, HTTP/HTTPS CONNECT, and SOCKS5 proxies.
 
 ## Installation
 
-```bash
+```sh
 cargo add fast_websocket_client
+cargo add tokio --features macros,rt,time
 ```
 
-## High-Level Callback API
+The default features include the callback client, proxy support, and the AWS-LC TLS provider. For just the low-level API with TLS, disable the default features and enable `aws_lc_rs` or `ring`.
 
-An ergonomic, JavaScript-like API with built-in reconnect, ping, and lifecycle hooks.
+## Callback API
 
-`WebSocket::connect().await`, `WebSocket::new().await`, and the builder's connect methods validate the URL and configuration, start a background task, and return a handle. Connection success is reported through `on_open`; network and handshake failures are reported through `on_error`. Use `WebSocketBuilder` to register callbacks before the first connection attempt.
+Create the socket, then register handlers on it. Text and binary messages have separate callbacks. Each handler runs to completion before the next one starts.
 
-`on_message` receives text as `String`; `on_binary` receives binary data as `Vec<u8>`.
-
-`on_close` receives a `CloseEvent` with the close code, reason, and whether the closing handshake completed successfully (`was_clean`).
-
-```rust
-// try this example with
-// `cargo run --example wss_client`
-
+```rust,no_run
+use fast_websocket_client::{WebSocket, WebSocketClientError};
 use tokio::time::{Duration, sleep};
-use fast_websocket_client::WebSocket;
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), fast_websocket_client::WebSocketClientError> {
+async fn main() -> Result<(), WebSocketClientError> {
     let ws = WebSocket::new("wss://echo.websocket.org").await?;
 
-    ws.on_open(|_| async move {
-        println!("[OPEN] WebSocket connection opened.");
-    })
-    .await;
+    ws.on_open(|_| async { println!("open") }).await;
+    ws.on_message(|text| async move { println!("text: {text}") }).await;
+    ws.on_binary(|bytes| async move { println!("binary: {bytes:?}") }).await;
+    ws.on_error(|error| async move { eprintln!("error: {error}") }).await;
     ws.on_close(|event| async move {
-        println!(
-            "[CLOSE] code={}, reason={:?}, clean={}",
-            event.code, event.reason, event.was_clean
-        );
-    })
-    .await;
-    ws.on_message(|message| async move {
-        println!("[MESSAGE] {}", message);
-    })
-    .await;
-    ws.on_binary(|bytes| async move {
-        println!("[BINARY] {:?}", bytes);
-    })
-    .await;
-    ws.on_error(|error| async move {
-        eprintln!("[ERROR] {}", error);
-    })
-    .await;
+        println!("close: {} {}", event.code, event.reason);
+    }).await;
 
-    sleep(Duration::from_secs(2)).await;
-    ws.send_binary(&[0, 1, 255]).await?;
-    for i in 1..5 {
-        let message = format!("#{}", i);
-        if let Err(e) = ws.send(&message).await {
-            eprintln!("[ERROR] Send error: {:?}", e);
-            break;
-        }
-        println!("[SEND] {}", message);
-        sleep(Duration::from_secs(2)).await;
+    ws.send_binary(&[1, 2, 3]).await?;
+    for n in 1..=3 {
+        ws.send(&format!("hello {n}")).await?;
+        sleep(Duration::from_secs(1)).await;
     }
 
     ws.close().await;
-    ws.await_shutdown().await?;
-    Ok(())
+    ws.await_shutdown().await
 }
 ```
 
-`close().await` requests shutdown and stops reconnection. An established connection has up to five seconds to complete its locally requested Close handshake. Set this limit with `ClientConfig::new().with_close_timeout(Duration::from_secs(3))`, passed to `connect_with_config` or `update_config`. Use `await_shutdown().await?` to wait for the task and propagate a task failure.
+`WebSocket::new().await` starts the connection in the background and returns a handle. On a multithreaded runtime, use `WebSocketBuilder` to install handlers before the first connection attempt when you need to observe its outcome.
 
-## Low-Level API
+## Low-level API
 
-The free `connect().await` helper waits for the TCP/TLS/WebSocket handshake and returns an established connection. If `receive_frame()` is cancelled, including by a timeout, discard that connection before receiving again. See `examples/base_client.rs` for reconnecting after a receive timeout.
+The free `connect().await` waits for the handshake and returns an `Online` client. To set headers, a proxy, or a message size limit first, configure an `Offline` client and call its `connect()` method.
 
-```rust
-use fast_websocket_client::{connect, OpCode};
+```rust,no_run
+use fast_websocket_client::{OpCode, connect};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut client = connect("wss://echo.websocket.org").await?;
+    let mut ws = connect("wss://echo.websocket.org").await?;
+    ws.send_string("hello").await?;
 
-    client.send_string("Hello, WebSocket!").await?;
-
-    let frame = client.receive_frame().await?;
+    let frame = ws.receive_frame().await?;
     if frame.opcode == OpCode::Text {
-        println!("Received: {}", String::from_utf8_lossy(&frame.payload));
+        println!("{}", String::from_utf8_lossy(&frame.payload));
     }
 
-    client.send_close("bye").await?;
-    Ok(())
+    ws.send_close("bye").await
 }
 ```
 
-## Running the Example
+## Running the examples
 
-Clone the repo and run:
+From a checkout of this repository:
 
-```bash
-cargo run --example wss_client
-```
-
-## Migration Guide (from `0.2.0`)
-
-| Old                                     | New                    |
-|-----------------------------------------|------------------------|
-| `client::Offline`                       | `base_client::Offline` |
-| `client::Online`                        | `base_client::Online`  |
-| `on_close` callback argument `()`       | `CloseEvent`; callbacks using `\|_\|` need no change. |
-| Runtime settings via `Online`'s methods | Must now be set before connect via `ConnectionInitOptions`.<br>Changes to the running `WebSocket` take effect on the next (re)connection. |
-
-**New users:** We recommend starting with the `WebSocket` API for best experience.
-
-## Documentation
-
-- [docs.rs/fast_websocket_client](https://docs.rs/fast_websocket_client)
-- [Examples](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/)
-- [fastwebsockets upstream](https://github.com/denoland/fastwebsockets)
-
----
-
-💡 Actively maintained - **contributions are welcome!**
+| Example | Command |
+| --- | --- |
+| [Callback client and browser JavaScript equivalent](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/async_callback_client.rs) | `cargo run --example wss_client` |
+| [Builder with named handlers and channels](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/builders_channels_handler_functions.rs) | `cargo run --example builders_channels_handler_functions` |
+| [Low-level Binance subscription with idle notifications](https://github.com/Osteoporosis/fast_websocket_client/blob/main/examples/base_client.rs) | `cargo run --example base_client` |
